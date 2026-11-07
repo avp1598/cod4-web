@@ -45,27 +45,13 @@ static uint32_t g_trace_call = 1;   /* RC_TRACE_CALL=addr: log indirect calls to
 
 void call_indirect(CPU *c, uint32_t target) {
     if (g_trace_call == 1) g_trace_call = getenv("RC_TRACE_CALL") ? (uint32_t)strtoul(getenv("RC_TRACE_CALL"), NULL, 16) : 0;
-    uint32_t traced_this = 0;
     if (g_trace_call && target == g_trace_call) {
         static int n;
-        if (n++ < 40) {
+        if (n++ < 40)
             fprintf(stderr, "[call] %08x from %08x ecx=%08x args %08x %08x %08x %08x\n", target, R32(c->esp), c->ecx,
                     R32(c->esp + 4), R32(c->esp + 8), R32(c->esp + 12), R32(c->esp + 16));
-            traced_this = c->ecx;
-        }
     }
     GuestFn fn = lookup_function(target);
-    if (traced_this && fn) {
-        fn(c);
-        /* debugging the lighting instance: +0xc0 multipliers, +0x140 blend, config(+0x10) +0x70..+0x8c */
-        uint32_t o = traced_this, cfg = R32(o + 0x10);
-        float f[4], t, a[8];
-        memcpy(f, HP(o + 0xc0), 16); memcpy(&t, HP(o + 0x140), 4);
-        if (cfg) memcpy(a, HP(cfg + 0x70), 32); else memset(a, 0, sizeof a);
-        fprintf(stderr, "[call]   -> mult %g %g %g %g  t %g  cfg %08x lo %g %g %g %g hi %g %g %g %g\n", f[0], f[1], f[2], f[3], t,
-                cfg, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
-        return;
-    }
     if (!fn && dyncode_contains(target)) { interp_call(c, target); return; }
     if (!fn) {
         static char msg[96];
@@ -90,13 +76,17 @@ void call_indirect(CPU *c, uint32_t target) {
 }
 
 void jump_indirect(CPU *c, uint32_t target, uint32_t from) {
-    /* An indirect jump that isn't a known switch case: treat as a tail call. */
+    (void)from;
+    /* An indirect jump that isn't a known switch case: to a function, a tail call. Anywhere else, control is
+       going back to code an active frame will continue (longjmp to a setjmp's return address, a jump to a
+       return address that was popped): unwind to the frame whose call returns there (see CPU.ret_to). If no
+       frame does, guest_enter traps. */
     GuestFn fn = lookup_function(target);
-    if (!fn) {
-        fprintf(stderr, "indirect jump from %08x\n", from);
-        guest_trap(c, target, "indirect jump to unknown target");
+    if (fn) {
+        fn(c);
+        return;
     }
-    fn(c);
+    c->ret_to = target;
 }
 
 void guest_bounds_fail(uint32_t a, int n) {
@@ -165,17 +155,153 @@ static double round_mode(CPU *c, double v) {
     }
 }
 
-int32_t fpu_to_int32(CPU *c, double v) {
-    double r = round_mode(c, v);
-    if (!(r >= -2147483648.0 && r <= 2147483647.0)) return INT32_MIN; /* "integer indefinite" */
-    return (int32_t)r;
-}
-
-int64_t fpu_to_int64(CPU *c, double v) {
-    double r = round_mode(c, v);
-    if (!(r >= -9223372036854775808.0 && r < 9223372036854775808.0)) return INT64_MIN;
+/* An already-rounded value as a `bits`-bit integer, or that size's "integer indefinite" (its most negative
+   value) when it is NaN or out of range. */
+static int64_t to_int_or_indefinite(double r, int bits) {
+    double hi = ldexp(1.0, bits - 1);
+    if (!(r >= -hi && r < hi)) return -(int64_t)(((uint64_t)1 << (bits - 1)) - 1) - 1;
     return (int64_t)r;
 }
+
+int16_t fpu_to_int16(CPU *c, double v) { return (int16_t)to_int_or_indefinite(round_mode(c, v), 16); }
+int32_t fpu_to_int32(CPU *c, double v) { return (int32_t)to_int_or_indefinite(round_mode(c, v), 32); }
+int64_t fpu_to_int64(CPU *c, double v) { return to_int_or_indefinite(round_mode(c, v), 64); }
+int16_t fpu_trunc_to_int16(double v) { return (int16_t)to_int_or_indefinite(trunc(v), 16); }
+int32_t fpu_trunc_to_int32(double v) { return (int32_t)to_int_or_indefinite(trunc(v), 32); }
+int64_t fpu_trunc_to_int64(double v) { return to_int_or_indefinite(trunc(v), 64); }
+
+/* Rounds to an integer in MXCSR rounding mode `rc` using only floor/ceil/trunc, which do not depend on the
+   host rounding mode (that one follows the x87 control word). */
+static double round_sse(double v, unsigned rc) {
+    switch (rc & 3) {
+    case 0: {  /* nearest, ties to even */
+        double f = floor(v), d = v - f;  /* exact: v and f are within one unit of each other */
+        if (d > 0.5 || (d == 0.5 && fmod(f, 2.0) != 0.0)) f += 1.0;
+        return f;
+    }
+    case 1: return floor(v);
+    case 2: return ceil(v);
+    default: return trunc(v);
+    }
+}
+
+int32_t sse_to_int32(uint32_t mxcsr, double v, int truncate) {
+    if (v != v) return INT32_MIN;
+    return (int32_t)to_int_or_indefinite(truncate ? trunc(v) : round_sse(v, mxcsr >> 13), 32);
+}
+
+float sse_int_to_float(uint32_t mxcsr, int32_t v) {
+    double x = (double)v;  /* exact */
+    float f = (float)x;    /* rounded in the host mode; corrected to the MXCSR mode below */
+    if ((double)f == x) return f;
+    float lo = (double)f < x ? f : nextafterf(f, -INFINITY), hi = nextafterf(lo, INFINITY);
+    switch ((mxcsr >> 13) & 3) {
+    case 0: {
+        double dl = x - (double)lo, dh = (double)hi - x;
+        if (dl != dh) return dl < dh ? lo : hi;
+        uint32_t bits;
+        memcpy(&bits, &lo, 4);
+        return (bits & 1) ? hi : lo;  /* tie: the even significand */
+    }
+    case 1: return lo;
+    case 2: return hi;
+    default: return x > 0 ? lo : hi;
+    }
+}
+
+/* ------------------------------------------------------------------ x86 NaN rules (see cpu.h) */
+
+static uint64_t bits_of(double v) { uint64_t b; memcpy(&b, &v, 8); return b; }
+static double double_of(uint64_t b) { double v; memcpy(&v, &b, 8); return v; }
+static uint32_t bits_of_f(float v) { uint32_t b; memcpy(&b, &v, 4); return b; }
+static float float_of(uint32_t b) { float v; memcpy(&v, &b, 4); return v; }
+#define QUIET64 0x0008000000000000ull
+#define INDEFINITE64 0xfff8000000000000ull
+#define QUIET32 0x00400000u
+#define INDEFINITE32 0xffc00000u
+
+double x87_nan1(double a) {
+    return a != a ? double_of(bits_of(a) | QUIET64) : double_of(INDEFINITE64);
+}
+
+double x87_nan2(double a, double b) {
+    int an = a != a, bn = b != b;
+    if (!an && !bn) return double_of(INDEFINITE64);
+    if (an != bn) return x87_nan1(an ? a : b);
+    uint64_t A = bits_of(a), B = bits_of(b);
+    if ((A & QUIET64) != (B & QUIET64)) return (A & QUIET64) ? a : b;  /* SNaN and QNaN: the QNaN */
+    uint64_t sa = A & 0x000fffffffffffffull, sb = B & 0x000fffffffffffffull;
+    if (sa != sb) return double_of((sa > sb ? A : B) | QUIET64);
+    return double_of(((A >> 63) ? B : A) | QUIET64);                   /* equal: the positive one */
+}
+
+double sse_nan1d(double a) { return x87_nan1(a); }
+
+double sse_nan2d(double a, double b) {
+    if (a != a) return double_of(bits_of(a) | QUIET64);
+    if (b != b) return double_of(bits_of(b) | QUIET64);
+    return double_of(INDEFINITE64);
+}
+
+float sse_nan1f(float a) {
+    return a != a ? float_of(bits_of_f(a) | QUIET32) : float_of(INDEFINITE32);
+}
+
+float sse_nan2f(float a, float b) {
+    if (a != a) return float_of(bits_of_f(a) | QUIET32);
+    if (b != b) return float_of(bits_of_f(b) | QUIET32);
+    return float_of(INDEFINITE32);
+}
+
+double fpu_scale(double a, double b) {
+    if (a != a || b != b) return x87_nan2(a, b);
+    if (isinf(b)) {
+        if (b > 0) return a == 0 ? double_of(INDEFINITE64) : a * b;       /* 0 * 2^inf is invalid */
+        return isinf(a) ? double_of(INDEFINITE64) : copysign(0.0, a);    /* inf * 2^-inf is invalid */
+    }
+    double n = trunc(b);
+    if (n > 100000.0) n = 100000.0;    /* any count past the exponent range gives the same result */
+    if (n < -100000.0) n = -100000.0;
+    return ldexp(a, (int)n);
+}
+
+/* Tag of one physical register as FNSAVE/FNSTENV store it: 11 empty, 01 zero, 10 special (NaN, infinity,
+   denormal: an 80-bit register holds every double denormal as a normal number, so only NaN and infinity),
+   00 valid. */
+static unsigned x87_tag(CPU *c, int p) {
+    if (!(c->ftags & (1u << p))) return 3;
+    double v = c->st[p];
+    if (v == 0) return 1;
+    if (v != v || isinf(v)) return 2;
+    return 0;
+}
+
+void fpu_save(CPU *c, uint32_t a) {
+    unsigned tw = 0;
+    for (int p = 0; p < 8; p++) tw |= x87_tag(c, p) << (2 * p);
+    W32(a + 0, 0xffff0000u | c->fpu_cw);
+    W32(a + 4, 0xffff0000u | FNSTSW(c));
+    W32(a + 8, 0xffff0000u | tw);
+    for (int k = 12; k < 28; k += 4) W32(a + k, 0);  /* FPU IP, CS/opcode, operand pointer and selector */
+    for (int i = 0; i < 8; i++) WF80(a + 28 + 10 * i, c->st[(c->top + i) & 7]);
+    c->fpu_cw = 0x037f; c->fpu_sw = 0; c->top = 0; c->ftags = 0;  /* then FNINIT */
+    fpu_sync_rounding(c);
+}
+
+void fpu_restore(CPU *c, uint32_t a) {
+    c->fpu_cw = R16(a + 0);
+    uint16_t sw = R16(a + 4), tw = R16(a + 8);
+    c->top = (sw >> 11) & 7;
+    c->fpu_sw = sw & ~0x3800;
+    c->ftags = 0;
+    for (int p = 0; p < 8; p++)
+        if (((tw >> (2 * p)) & 3) != 3) c->ftags |= (uint8_t)(1u << p);
+    for (int i = 0; i < 8; i++) c->st[(c->top + i) & 7] = RF80(a + 28 + 10 * i);
+    fpu_sync_rounding(c);
+}
+
+/* 32-bit Windows (XP): CS 0x1b, DS/ES/SS 0x23 (flat user segments), FS 0x3b (thread information block), GS 0 */
+uint16_t g_seg_selector[6] = { 0x23, 0x1b, 0x23, 0x23, 0x3b, 0x00 };
 
 double fpu_round(CPU *c, double v) { return round_mode(c, v); }
 
@@ -389,5 +515,19 @@ uint32_t guest_alloc(uint32_t size) {
 void guest_call(CPU *c, GuestFn fn, int nargs, const uint32_t *args) {
     for (int i = nargs - 1; i >= 0; i--) PUSH32(c, args[i]);
     PUSH32(c, GUEST_RETURN_SENTINEL);
+    uint32_t saved = c->ret_to;
+    c->ret_to = GUEST_RETURN_SENTINEL;
     fn(c);
+    if (c->ret_to != GUEST_RETURN_SENTINEL)
+        guest_trap(c, c->ret_to, "control returned to an address no active caller returns to");
+    c->ret_to = saved;
+}
+
+void guest_enter(CPU *c, uint32_t target) {
+    uint32_t saved = c->ret_to;  /* a host function called from guest code may be calling back into it */
+    c->ret_to = GUEST_RETURN_SENTINEL;
+    call_indirect(c, target);
+    if (c->ret_to != GUEST_RETURN_SENTINEL)
+        guest_trap(c, c->ret_to, "control returned to an address no active caller returns to");
+    c->ret_to = saved;
 }

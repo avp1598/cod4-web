@@ -18,3 +18,4 @@ ghidra_project/
 .wrangler/
 node_modules/
 .claude/
+work/

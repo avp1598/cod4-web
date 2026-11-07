@@ -56,11 +56,10 @@ static void *game_main(void *arg) {
     sched_main_init();
     t_self->cpu = *c;            /* keep the thread record consistent with the main CPU */
     fpu_sync_rounding(c);
-    GuestFn entry = lookup_function(g_img.entry);
-    if (!entry) { fprintf(stderr, "entry point %08x was not recompiled\n", g_img.entry); exit(1); }
+    if (!lookup_function(g_img.entry)) { fprintf(stderr, "entry point %08x was not recompiled\n", g_img.entry); exit(1); }
     fprintf(stderr, "starting game at %08x\n", g_img.entry);
     PUSH32(c, GUEST_RETURN_SENTINEL);
-    entry(c);
+    guest_enter(c, g_img.entry);
     fprintf(stderr, "game returned %d\n", (int)c->eax);
     exit((int)c->eax);
 }

@@ -6,6 +6,10 @@ buffer. After the function returns we compare all general registers and every by
 either side could have touched.
 
 Usage: difftest.py <exe> <functions.json> <build/librecomp.dylib> [--max N] [--trials K] [--only 0xADDR]
+
+Pass the translator's out_all/functions_translated.json as <functions.json> to test exactly the functions
+that were translated (Ghidra's plus the entries the translator found itself), with the instruction ranges
+it decoded.
 """
 import argparse
 import ctypes
@@ -15,14 +19,18 @@ import struct
 import sys
 
 import pefile
+from unicorn import x86_const as unicorn_x86
 from capstone import CS_ARCH_X86, CS_MODE_32, CS_OP_IMM, CS_OP_MEM, Cs
-from unicorn import UC_PROT_READ, UC_PROT_WRITE, UC_ARCH_X86, UC_HOOK_CODE, UC_HOOK_INSN, UC_HOOK_MEM_FETCH_UNMAPPED, UC_HOOK_MEM_READ_UNMAPPED, \
+from unicorn import UC_PROT_READ, UC_PROT_WRITE, UC_ARCH_X86, UC_HOOK_CODE, UC_HOOK_INSN, UC_HOOK_MEM_FETCH_UNMAPPED, UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_WRITE, \
     UC_HOOK_MEM_WRITE_UNMAPPED, UC_MODE_32, Uc, UcError
-from unicorn.x86_const import (UC_X86_INS_CPUID, UC_X86_REG_EAX, UC_X86_REG_EBP, UC_X86_REG_EBX, UC_X86_REG_ECX,
+from unicorn.x86_const import (UC_X86_REG_FPTAG, UC_X86_INS_CPUID, UC_X86_REG_EAX, UC_X86_REG_EBP, UC_X86_REG_EBX, UC_X86_REG_ECX,
                                UC_X86_REG_EDI, UC_X86_REG_EDX, UC_X86_REG_EIP, UC_X86_REG_ESI,
                                UC_X86_REG_ESP, UC_X86_REG_FPCW, UC_X86_REG_EFLAGS, UC_X86_REG_FS,
-                               UC_X86_REG_GDTR, UC_X86_REG_SS, UC_X86_REG_DS, UC_X86_REG_ES)
+                               UC_X86_REG_GDTR, UC_X86_REG_SS, UC_X86_REG_DS, UC_X86_REG_ES, UC_X86_REG_CS,
+                               UC_X86_REG_GS)
 
+# x86 Sreg encoding order (es, cs, ss, ds, fs, gs), as runtime/cpu.h's g_seg_selector is indexed
+SREGS = [UC_X86_REG_ES, UC_X86_REG_CS, UC_X86_REG_SS, UC_X86_REG_DS, UC_X86_REG_FS, UC_X86_REG_GS]
 REGS = [UC_X86_REG_EAX, UC_X86_REG_ECX, UC_X86_REG_EDX, UC_X86_REG_EBX,
         UC_X86_REG_ESP, UC_X86_REG_EBP, UC_X86_REG_ESI, UC_X86_REG_EDI]
 NAMES = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"]
@@ -30,9 +38,16 @@ PAGE = 0x1000
 SENTINEL = 0xDEADBEEF
 SCRATCH, SCRATCH_SIZE = 0x20000000, 0x10000
 STACK_LO, STACK_HI = 0x002F0000, 0x00300000
-FPU_CW = 0x027F  # 53-bit precision: what the recompiled x87 (host doubles) models exactly
+# x87 control word both sides start with (--fpu-cw): by default MSVC's, 53-bit precision and round to
+# nearest. Direct3D switches the FPU to 24-bit precision (0x007F) when it creates a device without
+# D3DCREATE_FPU_PRESERVE, so that is the other regime the game's code runs in.
+FPU_CW = 0x027F
 TIB = 0x00010000   # GUEST_TIB in runtime.h: fs:[0] is the SEH chain head
 GDT = 0x00001000
+# The last page of the 32-bit space. A multi-byte access there wraps to address 0 on x86 (and in Unicorn), but
+# not in the recompiled code's flat guest memory. Neither can happen in the game: everything from 0x80000000 up
+# is kernel space in a 32-bit Windows process, so trials whose random pointers reach this page are skipped.
+TOP_PAGE = 0xFFFFF000
 
 
 def gdt_entry(base, limit, access, flags):
@@ -49,33 +64,45 @@ GDT_PAGE = (bytes(16) + gdt_entry(0, 0xfffff, 0x80 | 0x10 | 0x2 | 0x1, 0xc)  # a
 
 
 def pick_functions(prog_img, base, funcs, jumptables, allow_calls=False):
+    """Splits funcs into the ones difftest can run and the ones it can't. Returns (picked, filtered), where
+    filtered holds (function, reason) so every function left out is reported as a skip with its reason."""
     md = Cs(CS_ARCH_X86, CS_MODE_32)
     md.detail = True
-    out = []
+    out, filtered = [], []
     for f in funcs:
-        ok, n = True, 0
+        why, n = None, 0
         for a, b in f["ranges"]:
             for ins in md.disasm(prog_img[a - base:b - base], a):
                 n += 1
                 m = ins.mnemonic
-                if (m == "call" and not allow_calls) or m.startswith(("int", "in ", "out", "hlt", "cpuid", "rdtsc")):
-                    ok = False
-                if m == "jmp" and ins.operands and ins.operands[0].type != CS_OP_IMM and ins.address not in jumptables:
-                    ok = False
-                if m == "jmp" and not allow_calls and ins.operands and ins.operands[0].type == CS_OP_IMM and not any(
+                if m == "call" and not allow_calls:
+                    why = f"calls other functions ({ins.address:08x})"
+                elif m.startswith(("int", "in ", "out", "hlt", "cpuid", "rdtsc")):
+                    why = f"uses {m} ({ins.address:08x})"
+                elif m == "jmp" and ins.operands and ins.operands[0].type != CS_OP_IMM and ins.address not in jumptables:
+                    why = f"indirect jmp that is not a known jump table ({ins.address:08x})"
+                elif m == "jmp" and not allow_calls and ins.operands and ins.operands[0].type == CS_OP_IMM and not any(
                         x <= ins.operands[0].imm < y for x, y in f["ranges"]):
-                    ok = False  # tail call
-                if any(ins.reg_name(r).startswith("mm") for r in ins.regs_access()[0] + ins.regs_access()[1]):
-                    ok = False
-            if not ok:
+                    why = f"tail call ({ins.address:08x})"
+                elif any(ins.reg_name(r).startswith("mm") for r in ins.regs_access()[0] + ins.regs_access()[1]):
+                    why = f"uses MMX registers ({ins.address:08x})"
+                if why:
+                    break
+            if why:
                 break
-        if ok and n >= 3:
+        if why is None and n < 3:
+            why = f"fewer than 3 instructions ({n})"
+        if why:
+            filtered.append((f, why))
+        else:
             out.append(f)
-    return out
+    return out, filtered
 
 
 class Tester:
-    def __init__(self, exe, lib):
+    def __init__(self, exe, lib, fpu_cw=FPU_CW):
+        self.fpu_cw = fpu_cw
+        self.fsave_sites = []  # set by find_fsave_sites
         self.lib = ctypes.CDLL(lib)
         self.lib.dt_mem.restype = ctypes.c_void_p
         self.lib.dt_trap_msg.restype = ctypes.c_char_p
@@ -83,6 +110,8 @@ class Tester:
         if self.lib.dt_init(exe.encode()) != 0:
             raise SystemExit("dt_init failed")
         self.mem = self.lib.dt_mem()
+        # Selectors read by `mov r/m, Sreg`: the recompiled side reports whatever the emulator's segments are
+        self.selectors = (ctypes.c_uint16 * 6).in_dll(self.lib, "g_seg_selector")
         pe = pefile.PE(exe, fast_load=True)
         self.base = pe.OPTIONAL_HEADER.ImageBase
         self.size = (pe.OPTIONAL_HEADER.SizeOfImage + PAGE - 1) & ~(PAGE - 1)
@@ -101,6 +130,38 @@ class Tester:
             while k >= 0:
                 self.rdtsc_sites.append(self.base + lo + k)
                 k = text.find(b"\x0f\x31", k + 1)
+
+    # FNSAVE/FNSTENV images: the recompiled code does not model the x87 instruction and operand pointers (FIP,
+    # FCS/FOP, FDP, FDS; only exception reporting reads them) and stores 0 there; QEMU stores the last x87
+    # instruction's address in FIP and zeros the rest. QEMU also leaves the reserved upper halves of the control,
+    # status and tag words 0 where the hardware sets them to 1 (the 80486 does, per Linux's math-emu; Bochs does
+    # the same). After each such instruction the emulator's image is brought to the modelled one.
+    def find_fsave_sites(self, exe_funcs):
+        md = Cs(CS_ARCH_X86, CS_MODE_32)
+        sites = set()
+        for f in exe_funcs:
+            for a, b in f["ranges"]:
+                for ins in md.disasm(self.image[a - self.base:b - self.base], a):
+                    if ins.mnemonic in ("fnsave", "fsave", "fnstenv", "fstenv"):
+                        sites.add((ins.address, ins.size))
+        self.fsave_sites = sorted(sites)
+
+    def fsave_hook(self, uc, addr, size, data):
+        isize, pending = data
+        md = Cs(CS_ARCH_X86, CS_MODE_32)
+        md.detail = True
+        ins = next(md.disasm(bytes(uc.mem_read(addr, isize)), addr, count=1))
+        m = ins.operands[0].mem
+        reg = lambda r: uc.reg_read(getattr(unicorn_x86, f"UC_X86_REG_{ins.reg_name(r).upper()}")) if r else 0
+        pending.append((reg(m.base) + reg(m.index) * m.scale + m.disp) & 0xffffffff)
+
+    @staticmethod
+    def fsave_fixup(uc, addr, size, pending):
+        while pending:
+            ea = pending.pop()
+            for k in (2, 6, 10):
+                uc.mem_write(ea + k, b"\xff\xff")
+            uc.mem_write(ea + 12, bytes(16))
 
     def cwrite(self, addr, data):
         ctypes.memmove(self.mem + addr, data, len(data))
@@ -123,10 +184,12 @@ class Tester:
         regs = [small(), ptr(), ptr(), small(), esp, ptr(), ptr(), ptr()]
         return scratch, stack, regs
 
-    def run_unicorn(self, entry, scratch, stack, regs, code_hook=None):
+    def run_unicorn(self, entry, scratch, stack, regs, code_hook=None, write_hook=None):
         uc = Uc(UC_ARCH_X86, UC_MODE_32)
         if code_hook:
             uc.hook_add(UC_HOOK_CODE, code_hook)
+        if write_hook:
+            uc.hook_add(UC_HOOK_MEM_WRITE, write_hook)
         uc.mem_map(self.base, self.size)
         uc.mem_write(self.base, self.image)
         uc.mem_map(SCRATCH, SCRATCH_SIZE)
@@ -143,11 +206,14 @@ class Tester:
         uc.mem_map(TIB, PAGE)
         uc.mem_write(TIB, self.tib)
         demand = []
+        pending = []
 
         def on_unmapped(uc_, access, addr, size, value, data):
             if access == UC_HOOK_MEM_FETCH_UNMAPPED or addr == SENTINEL:
                 return False
             page = addr & ~(PAGE - 1)
+            if page == TOP_PAGE or addr + size > 1 << 32:
+                top.append(addr)
             uc_.mem_map(page, PAGE, UC_PROT_READ | UC_PROT_WRITE)  # data only: calling into it is a crash
             demand.append(page)
             if (addr + size - 1) & ~(PAGE - 1) != page:
@@ -155,6 +221,7 @@ class Tester:
                 demand.append(page + PAGE)
             return True
 
+        top = []  # accesses to the last page: there a multi-byte access wraps to address 0 (see TOP_PAGE)
         uc.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED, on_unmapped)
         # Page 0 is hit constantly through small random "pointers". Map it up front: QEMU can drop the
         # rest of a `rep movs` whose destination page gets mapped on demand mid-instruction.
@@ -166,13 +233,19 @@ class Tester:
         uc.hook_add(UC_HOOK_INSN, cpuid_hook, None, 1, 0, UC_X86_INS_CPUID)
         for r, v in zip(REGS, regs):
             uc.reg_write(r, v)
-        uc.reg_write(UC_X86_REG_FPCW, FPU_CW)
+        uc.reg_write(UC_X86_REG_FPCW, self.fpu_cw)
+        uc.reg_write(UC_X86_REG_FPTAG, 0xFFFF)  # every register empty, as a Windows thread starts (and the C side)
+        for a, size in self.fsave_sites:
+            uc.hook_add(UC_HOOK_CODE, self.fsave_hook, (size, pending), begin=a, end=a)
+            uc.hook_add(UC_HOOK_CODE, self.fsave_fixup, pending, begin=a + size, end=a + size)
         uc.reg_write(UC_X86_REG_EFLAGS, 0x202)  # user-mode Windows: IF set
         try:
             uc.emu_start(entry, SENTINEL, timeout=2_000_000, count=2_000_000)
         except UcError as e:
             if uc.reg_read(UC_X86_REG_EIP) != SENTINEL:
                 return None, f"unicorn: {e} at eip={uc.reg_read(UC_X86_REG_EIP):08x}", demand
+        if top:
+            return None, f"unicorn: access at {top[0]:08x}, in the top page of the 4 GiB space", demand
         if nondet:
             return None, "unicorn: nondeterministic (rdtsc)", demand
         if uc.reg_read(UC_X86_REG_EIP) != SENTINEL:
@@ -207,6 +280,8 @@ class Tester:
             if uc is None:
                 return "skip", err
             # C side from the identical state
+            for k, r in enumerate(SREGS):
+                self.selectors[k] = uc.reg_read(r)
             self.cwrite(self.base, self.image)
             self.cwrite(SCRATCH, scratch)
             self.cwrite(STACK_LO, bytes(STACK_HI - STACK_LO))
@@ -216,7 +291,7 @@ class Tester:
             for p in demand:
                 self.cwrite(p, bytes(PAGE))
             cregs = (ctypes.c_uint32 * 8)(*regs)
-            rc = self.lib.dt_run(entry, cregs, FPU_CW)
+            rc = self.lib.dt_run(entry, cregs, self.fpu_cw)
             if rc == 1:
                 return "fail", f"trap {self.lib.dt_trap_msg().decode()}"
             if rc == 2:
@@ -282,23 +357,29 @@ def main():
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--shard", default="", help="k/n: test every n-th function starting at k")
     ap.add_argument("--allow-calls", action="store_true", help="also test functions that call others (whole call trees run on both sides)")
+    ap.add_argument("--fpu-cw", default="0x027f", help="x87 control word both sides start with (see FPU_CW)")
     a = ap.parse_args()
 
-    tester = Tester(a.exe, a.lib)
+    tester = Tester(a.exe, a.lib, int(a.fpu_cw, 16))
     d = json.load(open(a.functions_json))
+    tester.find_fsave_sites([f for f in d["functions"] if f["ranges"]])
     jumptables = {j["at"] for j in d["jumptables"]}
     funcs = [f for f in d["functions"] if f["ranges"]]
+    filtered = []
     if a.only:
         funcs = [f for f in funcs if f["entry"] == int(a.only, 16)]
     else:
-        funcs = pick_functions(tester.image, tester.base, funcs, jumptables, a.allow_calls)
+        funcs, filtered = pick_functions(tester.image, tester.base, funcs, jumptables, a.allow_calls)
     if a.max:
         funcs = funcs[:a.max]
     if a.shard:
         k, n = map(int, a.shard.split("/"))
         funcs = funcs[k::n]
-    print(f"testing {len(funcs)} functions x {a.trials} trials", flush=True)
+        filtered = filtered[k::n]
+    print(f"testing {len(funcs)} functions x {a.trials} trials ({len(filtered)} not selected)", flush=True)
     results = {"pass": [], "nan": [], "fp_range": [], "fpu_flags": [], "fail": [], "skip": []}
+    for f, why in filtered:
+        results["skip"].append((f"0x{f['entry']:08x}", f["name"], f"not selected: {why}"))
     for i, f in enumerate(funcs):
         if a.verbose: print(f"  run 0x{f['entry']:08x}", flush=True)
         status, why = tester.run(f, a.trials, a.seed)

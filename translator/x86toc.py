@@ -35,6 +35,44 @@ COND = {
 }
 
 
+# Every encoding of a near return. MSVC emits f3 c3 ("repz ret", the return AMD recommends after a branch)
+# in CRT routines such as __security_check_cookie; f2 c3 decodes as "bnd ret". Both prefixes are ignored by
+# the CPU on a return.
+RET = ("ret", "retn", "repz ret", "rep ret", "bnd ret")
+
+# Mnemonics that never occur in code a Win32 compiler emits for user mode: privileged or I/O instructions,
+# far transfers, and opcodes that only make sense in 16-bit or BCD code. A candidate entry whose code
+# contains one is data that happened to look like a function start.
+NOT_USER_CODE = frozenset((
+    "arpl", "bound", "les", "lds", "lcall", "ljmp", "retf", "retfw", "iret", "iretd", "in", "out", "insb", "insw",
+    "insd", "outsb", "outsw", "outsd", "hlt", "cli", "sti", "into", "aaa", "aas", "daa", "das", "aam", "aad",
+    "salc", "lgdt", "lidt", "lldt", "ltr", "lmsw", "clts", "invd", "wbinvd", "rdmsr", "wrmsr", "sysexit",
+    "int1",
+))
+
+SEGMENT_REGS = ("es", "cs", "ss", "ds", "fs", "gs")
+
+
+def not_user_code(ins):
+    """True for an instruction compiled 32-bit Windows user-mode code of this era never contains: see
+    NOT_USER_CODE, plus pushes/pops of segment registers, loads into segment registers, VEX/XOP-encoded
+    instructions (AVX and XOP postdate 2007) and MPX "bnd" branches."""
+    m = ins.mnemonic
+    if m.startswith("lock "):
+        m = m[5:]
+    if m in NOT_USER_CODE or m.startswith(("bnd ", "v")):
+        return True
+    o = ins.operands
+    if m in ("push", "pop") and o and o[0].type == CS_OP_REG and ins.reg_name(o[0].reg) in SEGMENT_REGS:
+        return True
+    return m == "mov" and o and o[0].type == CS_OP_REG and ins.reg_name(o[0].reg) in SEGMENT_REGS
+
+
+# Segment selectors the game sees on 32-bit Windows (read only by MSVC's __report_gsfailure, which copies
+# them into an exception record). Index = x86 Sreg encoding: es, cs, ss, ds, fs, gs.
+SREG_INDEX = {"es": 0, "cs": 1, "ss": 2, "ds": 3, "fs": 4, "gs": 5}
+
+
 class Unsupported(Exception):
     pass
 
@@ -82,18 +120,23 @@ _X87_REWRITES = [
 _SYNC_CALL = re.compile(r"\b(f_[0-9a-f]{8}|call_indirect|jump_indirect|guest_trap|cpuid|rdtsc|trace_insn)"
                         r"\(c\b[^;]*\);(\s*return;)?")
 _RETURN = re.compile(r"\breturn;")
+_TRACE_PREFIX = re.compile(r"trace_insn\(c, 0x[0-9a-f]{8}u\); ")
 _WRITES = [   # (pattern, bits, or a function of the match giving the bits)
     (re.compile(r"\br->(\w+)" + _ASSIGN + r"|\br->(\w+)\s*(?:\+\+|--)|(?:\+\+|--)\s*r->(\w+)"),
      lambda m: CBIT[m.group(1) or m.group(2) or m.group(3)]),
     (re.compile(r"\b" + _FLAG_HELPERS + r"r\(r,|\bFCOMIr\(r,"), FLAG_BITS),
     (re.compile(r"\bPUSH32r\(r,|\bPOP32r\(r\)"), CBIT["esp"]),
-    (re.compile(r"\bx->(?:s\[\d\]|top|sw)" + _ASSIGN + r"|\b(?:FPUSHx|FPOPx|FCOMx|FDIVx|FTRIGx)\(x"), X87_BIT),
+    (re.compile(r"\bx->(?:s\[\d\]|top|sw|tags)" + _ASSIGN + r"|\b(?:FPUSHx|FPOPx|FCOMx|FDIVx|FTRIGx)\(x"), X87_BIT),
     (re.compile(r"\bV_\[(\d)\](?:\.\w+(?:\[\d+\])?)?" + _ASSIGN + r"|\bmem(?:cpy|set)\((?:\(uint8_t \*\))?V_\[(\d)\]"),
      lambda m: XMM_BIT[int(m.group(1) or m.group(2))]),
     (re.compile(r"\bmem(?:cpy|set)\((?:\(uint8_t \*\))?&M_\[(\d)\]"), lambda m: MM_BIT[int(m.group(1))]),
 ]
 # helpers that receive the CPU but read only state that stays there (the control word, written through)
-_CPU_ONLY = {"fpu_to_int32", "fpu_to_int64", "fpu_round", "fpu_sync_rounding"}
+_CPU_ONLY = {"fpu_to_int16", "fpu_to_int32", "fpu_to_int64", "fpu_round", "fpu_sync_rounding", "fpu_save",
+             "fpu_restore"}
+# helpers that work on the CPU's whole x87 state: statements calling them run in x87-sync mode, like those
+# that move the stack top
+_X87_SYNC_HELPERS = ("fpu_save(", "fpu_restore(")
 _GOTO = re.compile(r"goto L_([0-9a-f]{8});")
 
 
@@ -108,7 +151,7 @@ class RegisterCache:
         for _, stmt in body:
             for rx, rep in _REWRITES:
                 stmt = rx.sub(rep, stmt)
-            sync = "c->top" in stmt
+            sync = "c->top" in stmt or any(h in stmt for h in _X87_SYNC_HELPERS)
             if not sync:
                 for rx, rep in _X87_REWRITES:
                     stmt = rx.sub(rep, stmt)
@@ -158,6 +201,9 @@ class RegisterCache:
         """(start, end, kind, value) in text order: writes, calls that see the CPU, returns."""
         stmt = self.texts[k]
         if self.x87_sync[k]:   # the whole statement works on the CPU's x87 state
+            t = _TRACE_PREFIX.match(stmt)
+            if t:  # a --trace build's trace call first: it sees the whole CPU, like any call
+                return [(0, t.end(), "call", t.group(0).strip()), (t.end(), len(stmt), "x87sync", stmt[t.end():])]
             return [(0, len(stmt), "x87sync", stmt)]
         ev = []
         for m in _SYNC_CALL.finditer(stmt):
@@ -309,17 +355,31 @@ class FunctionTranslator:
         if target in self.insn_addrs:
             self.labels.add(target)
             return f"goto L_{target:08x};"
+        # a tail call: whatever the callee returns to is this function's caller's business, except code of this
+        # function that it pushed as a return address itself
+        after = self.unwind_stmt() if self.resume_points else "return;"
         if target in self.p.entries:
-            return f"{{ f_{target:08x}(c); return; }}"
-        return f"{{ jump_indirect(c, 0x{target:08x}u, 0x{self.cur:08x}u); return; }}"
+            return f"{{ f_{target:08x}(c); {after} }}"
+        return f"{{ jump_indirect(c, 0x{target:08x}u, 0x{self.cur:08x}u); {after} }}"
+
+    def unwind_stmt(self):
+        """After a call that returned somewhere other than its return address (CPU.ret_to): continue here if
+        that is code of this function which it pushed as a return address itself (`push offset label; jmp f`),
+        otherwise return so that a frame further up can."""
+        cases = " ".join(f"case 0x{t:08x}u: goto L_{t:08x};" for t in sorted(self.resume_points))
+        for t in self.resume_points:
+            self.labels.add(t)
+        return f"switch (c->ret_to) {{ {cases} default: return; }}" if cases else "return;"
 
     def call_stmt(self, ins, target_expr, direct_target=None):
         ret = ins.address + ins.size
+        check = f"if (c->ret_to != 0x{ret:08x}u) {{ {self.unwind_stmt()} }}"
         if direct_target is not None:
             if direct_target in self.p.entries:
-                return f"PUSH32(c, 0x{ret:08x}u); f_{direct_target:08x}(c);"
-            return f"PUSH32(c, 0x{ret:08x}u); call_indirect(c, 0x{direct_target:08x}u);"
-        return f"{{ uint32_t t_ = {target_expr}; PUSH32(c, 0x{ret:08x}u); call_indirect(c, t_); }}"
+                return f"PUSH32(c, 0x{ret:08x}u); c->ret_to = 0x{ret:08x}u; f_{direct_target:08x}(c); {check}"
+            return f"PUSH32(c, 0x{ret:08x}u); c->ret_to = 0x{ret:08x}u; call_indirect(c, 0x{direct_target:08x}u); {check}"
+        return (f"{{ uint32_t t_ = {target_expr}; PUSH32(c, 0x{ret:08x}u); c->ret_to = 0x{ret:08x}u; "
+                f"call_indirect(c, t_); {check} }}")
 
     # ------------------------------------------------------------ translation
 
@@ -334,16 +394,18 @@ class FunctionTranslator:
         # targets in another fragment), so only Ghidra's function starts stop decoding.
         inside = lambda t: lo <= t < hi and (t == self.entry or t not in self.p.ghidra_entries)
         seen, todo = {}, [self.entry]
+        self.undecodable = []  # addresses reached by flow that hold no valid instruction
         while todo:
             a = todo.pop()
             while a not in seen and inside(a):
                 ins = next(self.p.md.disasm(self.p.code(a, a + 16), a, count=1), None)
                 if ins is None:
+                    self.undecodable.append(a)
                     break
                 seen[a] = ins
                 m = ins.mnemonic
                 op = ins.operands[0] if ins.operands else None
-                if (m == "jmp" or (m.startswith("j") and m[1:] in COND) or m in ("jecxz", "jcxz", "loop")) \
+                if (m == "jmp" or (m.startswith("j") and m[1:] in COND) or m in ("jecxz", "jcxz", "loop", "loope", "loopne")) \
                         and op is not None and op.type == CS_OP_IMM and inside(op.imm):
                     todo.append(op.imm)
                 if m == "jmp" and op is not None and op.type != CS_OP_IMM:
@@ -382,9 +444,18 @@ class FunctionTranslator:
 
     def translate(self):
         insns = self.decode()
+        self.insns = insns
         self.insn_addrs = {i.address for i in insns}
+        # code of this function it pushes as a return address itself: where a call can come back to (unwind_stmt)
+        self.resume_points = {i.operands[0].imm & 0xffffffff for i in insns if i.mnemonic == "push" and i.operands
+                              and i.operands[0].type == CS_OP_IMM and (i.operands[0].imm & 0xffffffff) in self.insn_addrs}
         body = []
         unsupported = []
+        if insns and insns[0].address != self.entry:
+            # The body is emitted in address order, but a function can own code below its entry (Ghidra puts
+            # shared tails and out-of-line blocks in the function that jumps to them): start at the entry.
+            self.cur = self.entry
+            body.append((None, self.target_stmt(self.entry)))
         for k, ins in enumerate(insns):
             self.cur = ins.address
             try:
@@ -421,14 +492,18 @@ class FunctionTranslator:
 
     @staticmethod
     def is_terminator(ins):
-        return ins.mnemonic in ("jmp", "ret", "retn", "int3", "hlt", "ud2")
+        return ins.mnemonic in RET or ins.mnemonic in ("jmp", "int3", "hlt", "ud2")
 
     def insn(self, ins):
         m = ins.mnemonic
+        if m.startswith("lock "):  # Capstone folds the prefix into the mnemonic; is_locked() handles the lock
+            m = m[5:]
         ops = ins.operands
         pre = ins.prefix
         rep = 0xF3 in pre or 0xF2 in pre
 
+        if m in RET:
+            return self.i_ret(ins, ops)
         if m.startswith("rep ") or m.startswith("repne ") or m.startswith("repe "):
             return self.string_op(ins, m.split()[1], m.split()[0])
         if m in ("movsb", "movsw", "stosb", "stosw", "stosd", "lodsb", "lodsw", "lodsd",
@@ -454,6 +529,13 @@ class FunctionTranslator:
 
     # --- data movement
     def i_mov(self, ins, o):
+        if o[1].type == CS_OP_REG and ins.reg_name(o[1].reg) in SREG_INDEX:
+            # mov r/m16, Sreg stores the 16-bit selector; with a 32-bit register destination the P6 and
+            # later zero the upper half
+            sel = f"(uint32_t)g_seg_selector[{SREG_INDEX[ins.reg_name(o[1].reg)]}]"
+            return self.write(ins, o[0], sel, 2 if o[0].type == CS_OP_MEM else o[0].size)
+        if o[0].type == CS_OP_REG and ins.reg_name(o[0].reg) in SREG_INDEX:
+            raise Unsupported("mov to segment register")
         return self.write(ins, o[0], self.read(ins, o[1], o[0].size))
 
     def i_movzx(self, ins, o):
@@ -489,6 +571,19 @@ class FunctionTranslator:
     def i_pushal(self, ins, o):
         return ("{ uint32_t s_ = c->esp; PUSH32(c, c->eax); PUSH32(c, c->ecx); PUSH32(c, c->edx); "
                 "PUSH32(c, c->ebx); PUSH32(c, s_); PUSH32(c, c->ebp); PUSH32(c, c->esi); PUSH32(c, c->edi); }")
+
+    def i_pushaw(self, ins, o):
+        # 16-bit pusha: the low words of the eight registers, SP as it was before the first push
+        regs = ["c->eax", "c->ecx", "c->edx", "c->ebx", "s_", "c->ebp", "c->esi", "c->edi"]
+        return ("{ uint32_t s_ = c->esp; " + " ".join(f"c->esp -= 2; W16(c->esp, (uint16_t){r});" for r in regs)
+                + " }")
+
+    def i_popaw(self, ins, o):
+        # 16-bit popa: replaces only the low words; the saved SP is skipped
+        regs = ["edi", "esi", "ebp", None, "ebx", "edx", "ecx", "eax"]
+        return "{ " + " ".join(
+            "c->esp += 2;" if r is None else
+            f"c->{r} = (c->{r} & 0xffff0000u) | R16(c->esp); c->esp += 2;" for r in regs) + " }"
 
     def i_popal(self, ins, o):
         return ("c->edi = POP32(c); c->esi = POP32(c); c->ebp = POP32(c); c->esp += 4; "
@@ -741,7 +836,8 @@ class FunctionTranslator:
         for t in targets:
             if t in self.insn_addrs:
                 self.labels.add(t)
-        return (f"{{ uint32_t t_ = {v}; switch (t_) {{ {cases} default: jump_indirect(c, t_, 0x{ins.address:08x}u); return; }} }}")
+        after = self.unwind_stmt() if self.resume_points else "return;"
+        return (f"{{ uint32_t t_ = {v}; switch (t_) {{ {cases} default: jump_indirect(c, t_, 0x{ins.address:08x}u); {after} }} }}")
 
     def i_call(self, ins, o):
         if o[0].type == CS_OP_IMM:
@@ -750,9 +846,15 @@ class FunctionTranslator:
 
     def i_ret(self, ins, o):
         n = 4 + (o[0].imm if o else 0)
-        return f"c->esp += {n}; return;"
+        return f"c->ret_to = R32(c->esp); c->esp += {n}; return;"
 
     i_retn = i_ret
+
+    def i_enter(self, ins, o):
+        # enter size, 0: push ebp; mov ebp, esp; sub esp, size. Nesting levels above 0 copy frame pointers.
+        if o[1].imm & 0x1f:
+            raise Unsupported("enter with nesting level")
+        return f"PUSH32(c, c->ebp); c->ebp = c->esp; c->esp -= {o[0].imm & 0xffff}u;"
 
     def i_leave(self, ins, o):
         return "c->esp = c->ebp; c->ebp = POP32(c);"
@@ -765,6 +867,12 @@ class FunctionTranslator:
 
     def i_loop(self, ins, o):
         return f"if (--c->ecx != 0) {self.target_stmt(o[0].imm)}"
+
+    def i_loope(self, ins, o):   # loop does not change the flags; the ZF test reads the last flag-setting op
+        return f"if (--c->ecx != 0 && c->zf) {self.target_stmt(o[0].imm)}"
+
+    def i_loopne(self, ins, o):
+        return f"if (--c->ecx != 0 && !c->zf) {self.target_stmt(o[0].imm)}"
 
     # --- string instructions
     def string_op(self, ins, m, rep):
@@ -811,33 +919,36 @@ class FunctionTranslator:
         if integer:
             return {2: f"(double)(int16_t)R16({a})", 4: f"(double)(int32_t)R32({a})",
                     8: f"(double)(int64_t)R64({a})"}[op.size]
-        return {4: f"(double)RF32({a})", 8: f"RF64({a})", 10: f"RF80({a})"}[op.size]
+        return {4: f"fld_f32(R32({a}))", 8: f"fld_f64(R64({a}))", 10: f"RF80({a})"}[op.size]
 
     def x87(self, ins, m, o):
-        P = "FPRES(c, {})"
         binops = {"fadd": "{a} + {b}", "fmul": "{a} * {b}", "fsub": "{a} - {b}", "fsubr": "{b} - {a}",
                   "fdiv": "FDIV(c, {a}, {b})", "fdivr": "FDIV(c, {b}, {a})"}
+
+        def arith(dst, e, a, b):
+            # dst = e(a, b) rounded to the precision control; a NaN result takes x86's NaN (see x87_nan2)
+            return (f"{{ double a_ = {a}, b_ = {b}; double r_ = {e.format(a='a_', b='b_')}; "
+                    f"if (r_ != r_) r_ = x87_nan2(a_, b_); {dst} = FPRES(c, r_); }}")
+
         base = m.rstrip("p") if m not in ("fsubp", "fdivp", "faddp", "fmulp", "fsubrp", "fdivrp") else m[:-1]
         if m in ("fiadd", "fisub", "fisubr", "fimul", "fidiv", "fidivr"):
-            b = self.fmem(ins, o[0], integer=True)
-            e = binops["f" + m[2:]].format(a="ST(0)", b=b)
-            return f"ST(0) = {P.format(e)};"
+            return arith("ST(0)", binops["f" + m[2:]], "ST(0)", self.fmem(ins, o[0], integer=True))
         if base in binops:
             e = binops[base]
             pop = m.endswith("p") and m not in ("fsubr",) and m != "fsub"
             if len(o) == 0:  # faddp with no operands == faddp st(1), st(0)
-                return f"ST(1) = {P.format(e.format(a='ST(1)', b='ST(0)'))}; FPOP(c);"
+                return arith("ST(1)", e, "ST(1)", "ST(0)") + " FPOP(c);"
             if o[0].type == CS_OP_MEM:
-                return f"ST(0) = {P.format(e.format(a='ST(0)', b=self.fmem(ins, o[0])))};"
+                return arith("ST(0)", e, "ST(0)", self.fmem(ins, o[0]))
             if len(o) == 1:
                 i = self.st_idx(ins, o[0])
                 if pop:  # "fsubp st(i)" == FSUBP ST(i), ST(0)
-                    return f"ST({i}) = {P.format(e.format(a=f'ST({i})', b='ST(0)'))}; FPOP(c);"
+                    return arith(f"ST({i})", e, f"ST({i})", "ST(0)") + " FPOP(c);"
                 # "fsub st(i)" == FSUB ST(0), ST(i)
-                return f"ST(0) = {P.format(e.format(a='ST(0)', b=f'ST({i})'))};"
+                return arith("ST(0)", e, "ST(0)", f"ST({i})")
             d, s = self.st_idx(ins, o[0]), self.st_idx(ins, o[1])
             # Intel semantics: "fsubp st(i), st(0)" => st(i) = st(i) - st(0); "fsubrp" => st(0) - st(i)
-            return f"ST({d}) = {P.format(e.format(a=f'ST({d})', b=f'ST({s})'))};" + (" FPOP(c);" if pop else "")
+            return arith(f"ST({d})", e, f"ST({d})", f"ST({s})") + (" FPOP(c);" if pop else "")
         if m == "fld":
             if o[0].type == CS_OP_MEM:
                 return f"FPUSH(c, {self.fmem(ins, o[0])});"
@@ -853,9 +964,11 @@ class FunctionTranslator:
             return f"ST({self.st_idx(ins, o[0])}) = ST(0);" + pop
         if m in ("fist", "fistp", "fisttp"):
             a = self.addr(ins, o[0])
-            conv = "fpu_to_int64" if o[0].size == 8 else "fpu_to_int32"
+            # out-of-range values store the "integer indefinite" of the destination size (0x8000, 0x80000000,
+            # 0x8000000000000000); fisttp always truncates, the others round per the control word
+            conv = {2: "fpu_to_int16", 4: "fpu_to_int32", 8: "fpu_to_int64"}[o[0].size]
             if m == "fisttp":
-                conv_e = f"({ST_[o[0].size]})trunc(ST(0))"
+                conv_e = f"{conv.replace('fpu_to', 'fpu_trunc_to')}(ST(0))"
             else:
                 conv_e = f"{conv}(c, ST(0))"
             w = {2: f"W16({a}, (uint16_t)(int16_t){conv_e});", 4: f"W32({a}, (uint32_t){conv_e});",
@@ -868,11 +981,16 @@ class FunctionTranslator:
                   "fldlg2": "0.30102999566398119521", "fldl2t": "3.32192809488736234787"}
         if m in consts:
             return f"FPUSH(c, {consts[m]});"
-        unary = {"fchs": "-ST(0)", "fabs": "fabs(ST(0))", "fsqrt": "FPRES(c, sqrt(ST(0)))",
-                 "fsin": "FTRIG(c, ST(0), sin)", "fcos": "FTRIG(c, ST(0), cos)",
-                 "frndint": "fpu_round(c, ST(0))", "f2xm1": "(exp2(ST(0)) - 1.0)"}
+        unary = {"fchs": "-ST(0)", "fabs": "fabs(ST(0))", "frndint": "fpu_round(c, ST(0))"}
         if m in unary:
             return f"ST(0) = {unary[m]};"
+        # one-operand maths whose NaN results follow x86 (x87_nan1)
+        nan1 = {"fsqrt": "FPRES(c, {r})", "fsin": "{r}", "fcos": "{r}", "f2xm1": "{r}"}
+        fn1 = {"fsqrt": "sqrt(v_)", "fsin": "FTRIG(c, v_, sin)", "fcos": "FTRIG(c, v_, cos)",
+               "f2xm1": "(exp2(v_) - 1.0)"}
+        if m in nan1:
+            return (f"{{ double v_ = ST(0), r_ = {fn1[m]}; if (r_ != r_) r_ = x87_nan1(v_); "
+                    f"ST(0) = {nan1[m].format(r='r_')}; }}")
         if m == "fsincos":
             return ("{ double v_ = ST(0); if (fabs(v_) >= 9223372036854775808.0) c->fpu_sw |= 0x0400; "
                     "else { c->fpu_sw &= ~0x0400; ST(0) = sin(v_); FPUSH(c, cos(v_)); } }")
@@ -880,14 +998,17 @@ class FunctionTranslator:
             return ("{ double v_ = ST(0); if (fabs(v_) >= 9223372036854775808.0) c->fpu_sw |= 0x0400; "
                     "else { c->fpu_sw &= ~0x0400; ST(0) = tan(v_); FPUSH(c, 1.0); } }")
         if m == "fpatan":
-            return "ST(1) = atan2(ST(1), ST(0)); FPOP(c);"
+            return ("{ double a_ = ST(1), b_ = ST(0), r_ = atan2(a_, b_); if (r_ != r_) r_ = x87_nan2(a_, b_); "
+                    "ST(1) = r_; FPOP(c); }")
         if m == "fyl2x":
-            return "ST(1) = ST(1) * log2(ST(0)); FPOP(c);"
+            return ("{ double a_ = ST(1), b_ = ST(0), r_ = a_ * log2(b_); if (r_ != r_) r_ = x87_nan2(a_, b_); "
+                    "ST(1) = r_; FPOP(c); }")
         if m == "fscale":
-            return "ST(0) = ldexp(ST(0), (int)trunc(ST(1)));"
+            return "ST(0) = fpu_scale(ST(0), ST(1));"
         if m in ("fprem", "fprem1"):
             fn = "fmod" if m == "fprem" else "remainder"
-            return f"ST(0) = {fn}(ST(0), ST(1)); c->fpu_sw &= ~0x0400;"
+            return (f"{{ double a_ = ST(0), b_ = ST(1), r_ = {fn}(a_, b_); if (r_ != r_) r_ = x87_nan2(a_, b_); "
+                    f"ST(0) = r_; c->fpu_sw &= ~0x0400; }}")
         if m in ("fcom", "fcomp", "fucom", "fucomp", "ficom", "ficomp"):
             if not o:
                 b = "ST(1)"
@@ -910,8 +1031,10 @@ class FunctionTranslator:
         if m == "ftst":
             return "FCOM(c, ST(0), 0.0);"
         if m == "fxam":
-            return ("{ double v_ = ST(0); uint16_t sw_ = c->fpu_sw & ~0x4700; if (signbit(v_)) sw_ |= 0x0200; "
-                    "if (isnan(v_)) sw_ |= 0x0100; else if (isinf(v_)) sw_ |= 0x0500; else if (v_ == 0) sw_ |= 0x4000; "
+            # C3 C2 C0: empty 1 0 1, NaN 0 0 1, infinity 0 1 1, zero 1 0 0, normal 0 1 0; C1 = sign
+            return ("{ double v_ = c->st[c->top]; uint16_t sw_ = c->fpu_sw & ~0x4700; if (signbit(v_)) sw_ |= 0x0200; "
+                    "if (!((c->ftags >> c->top) & 1)) sw_ |= 0x4100; "
+                    "else if (isnan(v_)) sw_ |= 0x0100; else if (isinf(v_)) sw_ |= 0x0500; else if (v_ == 0) sw_ |= 0x4000; "
                     "else sw_ |= 0x0400; c->fpu_sw = sw_; }")
         if m in ("fnstsw", "fstsw"):
             if o and o[0].type == CS_OP_REG:
@@ -924,9 +1047,13 @@ class FunctionTranslator:
         if m in ("fnclex", "fclex"):
             return "c->fpu_sw &= 0x7f00;"
         if m in ("fninit", "finit"):
-            return "c->fpu_cw = 0x037f; c->fpu_sw = 0; c->top = 0; fpu_sync_rounding(c);"
+            return "c->fpu_cw = 0x037f; c->fpu_sw = 0; c->top = 0; c->ftags = 0; fpu_sync_rounding(c);"
         if m == "ffree":
-            return ";"
+            return f"c->ftags &= (uint8_t)~(1u << ((c->top + {self.st_idx(ins, o[0])}) & 7));"
+        if m in ("fnsave", "fsave"):
+            return f"fpu_save(c, {self.addr(ins, o[0])});"
+        if m == "frstor":
+            return f"fpu_restore(c, {self.addr(ins, o[0])});"
         if m == "fincstp":
             return "c->top = (c->top + 1) & 7;"
         if m == "fdecstp":
@@ -978,7 +1105,7 @@ class FunctionTranslator:
     def vector_int(self, ins, m, o):
         if m in ("emms", "femms"):
             return ";"
-        if not o:
+        if not o or m in ("cvtpi2ps", "cvtps2pi", "cvttps2pi"):  # MMX <-> XMM conversions: see sse()
             return None
         d = self.vreg(ins, o[0])
         if m in self.VBIN and d and len(o) == 2:
@@ -1046,7 +1173,86 @@ class FunctionTranslator:
             raise Unsupported("MMX/non-XMM operand")
         return f"c->xmm[{ins.reg_name(op.reg)[3:]}]"
 
+    def sse2_double(self, ins, m, o):
+        """The SSE2 double-precision instructions this binary contains (the CRT's SSE2 maths). Arithmetic NaN
+        results follow x86 (sse_nan2d); conversions to integers give 0x80000000 when out of range."""
+        def src(k):  # lane k of the second operand
+            if o[1].type == CS_OP_MEM:
+                return f"RF64({self.addr(ins, o[1])} + {8 * k})"
+            return f"{self.xmm(ins, o[1])}.d[{k}]"
+
+        def srcq(k):
+            if o[1].type == CS_OP_MEM:
+                return f"R64({self.addr(ins, o[1])} + {8 * k})"
+            return f"{self.xmm(ins, o[1])}.q[{k}]"
+
+        arith = {"addsd": "+", "subsd": "-", "mulsd": "*", "divsd": "/",
+                 "addpd": "+", "subpd": "-", "mulpd": "*", "divpd": "/"}
+        if m in arith:
+            d, n = self.xmm(ins, o[0]), (1 if m.endswith("sd") else 2)
+            loads = " ".join(f"double s{k}_ = {src(k)};" for k in range(n))
+            body = " ".join(f"{{ double r_ = {d}.d[{k}] {arith[m]} s{k}_; if (r_ != r_) r_ = sse_nan2d({d}.d[{k}], s{k}_); "
+                            f"{d}.d[{k}] = r_; }}" for k in range(n))
+            return f"{{ {loads} {body} }}"
+        if m in ("sqrtsd", "sqrtpd"):
+            d, n = self.xmm(ins, o[0]), (1 if m == "sqrtsd" else 2)
+            loads = " ".join(f"double s{k}_ = {src(k)};" for k in range(n))
+            body = " ".join(f"{{ double r_ = sqrt(s{k}_); {d}.d[{k}] = r_ != r_ ? sse_nan1d(s{k}_) : r_; }}" for k in range(n))
+            return f"{{ {loads} {body} }}"
+        if m in ("andpd", "andnpd", "orpd", "xorpd"):
+            d = self.xmm(ins, o[0])
+            e = {"andpd": "{d} & {s}", "andnpd": "~{d} & {s}", "orpd": "{d} | {s}", "xorpd": "{d} ^ {s}"}[m]
+            loads = " ".join(f"uint64_t s{k}_ = {srcq(k)};" for k in range(2))
+            return "{ " + loads + " " + " ".join(f"{d}.q[{k}] = " + e.format(d=f"{d}.q[{k}]", s=f"s{k}_") + ";"
+                                                 for k in range(2)) + " }"
+        if m == "movsd":  # the SSE2 move (the string movsd, with two memory operands, is handled earlier)
+            if o[0].type == CS_OP_MEM:
+                return f"W64({self.addr(ins, o[0])}, {self.xmm(ins, o[1])}.q[0]);"
+            d = self.xmm(ins, o[0])
+            if o[1].type == CS_OP_MEM:
+                return f"{d}.q[0] = R64({self.addr(ins, o[1])}); {d}.q[1] = 0;"
+            return f"{d}.q[0] = {self.xmm(ins, o[1])}.q[0];"
+        if m in ("movlpd", "movhpd"):
+            k = 0 if m == "movlpd" else 1
+            if o[0].type == CS_OP_MEM:
+                return f"W64({self.addr(ins, o[0])}, {self.xmm(ins, o[1])}.q[{k}]);"
+            return f"{self.xmm(ins, o[0])}.q[{k}] = R64({self.addr(ins, o[1])});"
+        if m in ("unpcklpd", "unpckhpd"):
+            d, k = self.xmm(ins, o[0]), (0 if m == "unpcklpd" else 1)
+            return f"{{ uint64_t a_ = {d}.q[{k}], b_ = {srcq(k)}; {d}.q[0] = a_; {d}.q[1] = b_; }}"
+        if m == "shufpd":
+            d, imm = self.xmm(ins, o[0]), o[2].imm
+            return (f"{{ uint64_t a_ = {d}.q[{imm & 1}], b_ = {srcq((imm >> 1) & 1)}; "
+                    f"{d}.q[0] = a_; {d}.q[1] = b_; }}")
+        if m in ("comisd", "ucomisd"):
+            return f"FCOMI(c, {self.xmm(ins, o[0])}.d[0], {src(0)});"
+        pred = {"eq": "a_ == b_", "lt": "a_ < b_", "le": "a_ <= b_", "unord": "(a_ != a_ || b_ != b_)",
+                "neq": "!(a_ == b_)", "nlt": "!(a_ < b_)", "nle": "!(a_ <= b_)", "ord": "(a_ == a_ && b_ == b_)"}
+        if m.startswith("cmp") and m[-2:] in ("sd", "pd") and m[3:-2] in pred:
+            d, n = self.xmm(ins, o[0]), (1 if m.endswith("sd") else 2)
+            loads = " ".join(f"double s{k}_ = {src(k)};" for k in range(n))
+            return "{ " + loads + " " + " ".join(
+                f"{{ double a_ = {d}.d[{k}], b_ = s{k}_; {d}.q[{k}] = ({pred[m[3:-2]]}) ? ~0ull : 0; }}"
+                for k in range(n)) + " }"
+        if m in ("cvttsd2si", "cvtsd2si"):
+            return self.write(ins, o[0], f"(uint32_t)sse_to_int32(c->mxcsr, {src(0)}, {int(m == 'cvttsd2si')})")
+        if m == "cvtsi2sd":
+            return f"{self.xmm(ins, o[0])}.d[0] = (double)(int32_t){self.read(ins, o[1], 4)};"  # exact
+        if m == "cvtdq2pd":
+            d = self.xmm(ins, o[0])
+            if o[1].type == CS_OP_MEM:
+                a = self.addr(ins, o[1])
+                load = f"int32_t i0_ = (int32_t)R32({a}), i1_ = (int32_t)R32({a} + 4);"
+            else:
+                sx = self.xmm(ins, o[1])
+                load = f"int32_t i0_ = (int32_t){sx}.u[0], i1_ = (int32_t){sx}.u[1];"
+            return f"{{ {load} {d}.d[0] = i0_; {d}.d[1] = i1_; }}"  # exact
+        return None
+
     def sse(self, ins, m, o):
+        r = self.sse2_double(ins, m, o)
+        if r is not None:
+            return r
         packed = {"addps": "+", "subps": "-", "mulps": "*", "divps": "/"}
         scalar = {"addss": "+", "subss": "-", "mulss": "*", "divss": "/"}
         if m in packed or m in scalar:
@@ -1059,7 +1265,8 @@ class FunctionTranslator:
             else:
                 s = self.xmm(ins, o[1])
                 src = lambda k: f"{s}.f[{k}]"
-            body = " ".join(f"{d}.f[{k}] = {d}.f[{k}] {opr} s{k}_;" for k in range(n))
+            body = " ".join(f"{{ float r_ = {d}.f[{k}] {opr} s{k}_; if (r_ != r_) r_ = sse_nan2f({d}.f[{k}], s{k}_); "
+                            f"{d}.f[{k}] = r_; }}" for k in range(n))
             loads = " ".join(f"float s{k}_ = {src(k)};" for k in range(n))
             return f"{{ {loads} {body} }}"
         if m in ("movaps", "movups", "movdqa", "movdqu", "movapd", "movupd"):
@@ -1108,13 +1315,17 @@ class FunctionTranslator:
             return (f"{{ XMM t_ = {d}; {d}.f[0] = t_.f[{sel[0]}]; {d}.f[1] = t_.f[{sel[1]}]; "
                     f"{d}.f[2] = {s(sel[2])}; {d}.f[3] = {s(sel[3])}; }}")
         if m in ("unpcklps", "unpckhps"):
-            d, s = self.xmm(ins, o[0]), self.xmm(ins, o[1])
+            # moved as bit patterns: copying through float would quiet signalling NaNs
+            d = self.xmm(ins, o[0])
+            if o[1].type == CS_OP_MEM:
+                load = f"XMM b_; memcpy(b_.b, HP({self.addr(ins, o[1])}), 16);"
+            else:
+                load = f"XMM b_ = {self.xmm(ins, o[1])};"
             b = 0 if m == "unpcklps" else 2
-            return (f"{{ XMM a_ = {d}, b_ = {s}; {d}.f[0] = a_.f[{b}]; {d}.f[1] = b_.f[{b}]; "
-                    f"{d}.f[2] = a_.f[{b + 1}]; {d}.f[3] = b_.f[{b + 1}]; }}")
-        sfn = {"sqrtss": "sqrtf({})", "rsqrtss": "1.0f / sqrtf({})", "rcpss": "1.0f / {}"}
-        pfn = {"sqrtps": "sqrtf({})", "rsqrtps": "1.0f / sqrtf({})", "rcpps": "1.0f / {}",
-               "minps": None, "maxps": None}
+            return (f"{{ XMM a_ = {d}; {load} {d}.u[0] = a_.u[{b}]; {d}.u[1] = b_.u[{b}]; "
+                    f"{d}.u[2] = a_.u[{b + 1}]; {d}.u[3] = b_.u[{b + 1}]; }}")
+        sfn = {"sqrtss": "sse_sqrtf({})", "rsqrtss": "sse_rsqrtf({})", "rcpss": "sse_rcpf({})"}
+        pfn = {"sqrtps": "sse_sqrtf({})", "rsqrtps": "sse_rsqrtf({})", "rcpps": "sse_rcpf({})"}
         if m in sfn:
             d = self.xmm(ins, o[0])
             s = f"RF32({self.addr(ins, o[1])})" if o[1].type == CS_OP_MEM else f"{self.xmm(ins, o[1])}.f[0]"
@@ -1138,11 +1349,36 @@ class FunctionTranslator:
             s = f"RF32({self.addr(ins, o[1])})" if o[1].type == CS_OP_MEM else f"{self.xmm(ins, o[1])}.f[0]"
             return f"FCOMI(c, {self.xmm(ins, o[0])}.f[0], {s});"
         if m == "cvtsi2ss":
-            return f"{self.xmm(ins, o[0])}.f[0] = (float)(int32_t){self.read(ins, o[1], 4)};"
+            return f"{self.xmm(ins, o[0])}.f[0] = sse_int_to_float(c->mxcsr, (int32_t){self.read(ins, o[1], 4)});"
         if m in ("cvttss2si", "cvtss2si"):
+            # NaN and out-of-range give 0x80000000; cvtss2si rounds per MXCSR, not the x87 control word
             s = f"RF32({self.addr(ins, o[1])})" if o[1].type == CS_OP_MEM else f"{self.xmm(ins, o[1])}.f[0]"
-            conv = f"(int32_t){s}" if m == "cvttss2si" else f"(int32_t)nearbyintf({s})"
-            return self.write(ins, o[0], f"(uint32_t){conv}")
+            return self.write(ins, o[0], f"(uint32_t)sse_to_int32(c->mxcsr, {s}, {int(m == 'cvttss2si')})")
+        if m in ("cvtps2pi", "cvttps2pi"):
+            # two floats -> two int32 in an MMX register
+            d = self.vreg(ins, o[0])
+            if o[1].type == CS_OP_MEM:
+                a = self.addr(ins, o[1])
+                src = lambda k: f"RF32({a} + {4 * k})"
+            else:
+                sx = self.xmm(ins, o[1])
+                src = lambda k: f"{sx}.f[{k}]"
+            t = int(m == "cvttps2pi")
+            return (f"{{ int32_t r_[2] = {{ sse_to_int32(c->mxcsr, {src(0)}, {t}), sse_to_int32(c->mxcsr, {src(1)}, {t}) }}; "
+                    f"memcpy({d[0]}, r_, 8); }}")
+        if m == "cvtpi2ps":
+            # two int32 -> two floats in the low half; the high half is kept. int32 -> float rounds per MXCSR.
+            d = self.xmm(ins, o[0])
+            if o[1].type == CS_OP_MEM:
+                a = self.addr(ins, o[1])
+                load = f"int32_t i_[2] = {{ (int32_t)R32({a}), (int32_t)R32({a} + 4) }};"
+            else:
+                load = f"int32_t i_[2]; memcpy(i_, {self.vreg(ins, o[1])[0]}, 8);"
+            return (f"{{ {load} {d}.f[0] = sse_int_to_float(c->mxcsr, i_[0]); "
+                    f"{d}.f[1] = sse_int_to_float(c->mxcsr, i_[1]); }}")
+        if m == "movntps":
+            # non-temporal store: only the cache hint differs from movaps
+            return f"memcpy(HP({self.addr(ins, o[0])}), {self.xmm(ins, o[1])}.b, 16);"
         if m == "movd":
             if o[0].type == CS_OP_REG and ins.reg_name(o[0].reg).startswith("xmm"):
                 d = self.xmm(ins, o[0])
@@ -1178,9 +1414,6 @@ class FunctionTranslator:
             d = self.xmm(ins, o[0])
             v = f"R64({self.addr(ins, o[1])})" if o[1].type == CS_OP_MEM else f"{self.xmm(ins, o[1])}.q[0]"
             return f"{{ uint64_t v_ = {v}; {d}.q[0] = v_; {d}.q[1] = 0; }}"
-        if m == "cvtpi2ps" and o[1].type == CS_OP_MEM:
-            d, a = self.xmm(ins, o[0]), self.addr(ins, o[1])
-            return f"{d}.f[0] = (float)(int32_t)R32({a}); {d}.f[1] = (float)(int32_t)R32({a} + 4);"
         if m == "cvtps2pd":
             d = self.xmm(ins, o[0])
             if o[1].type == CS_OP_MEM:
@@ -1211,6 +1444,154 @@ class Program:
         self.md.detail = True
         self.trace = False
         self.add_pointer_entries(pe)
+        self.rejected = []        # (entry, reason) of candidate entries found to be data
+        self.flow_entries = 0     # entries added because control flow or a pointer table reaches them
+        self._analysis = {}
+        self.settle()
+
+    def add_entry(self, t):
+        """A new function entry at t, spanning to the next known entry (decoding follows the flow from t)."""
+        import bisect
+        ordered = sorted(self.entries)
+        k = bisect.bisect_right(ordered, t)
+        nxt = ordered[k] if k < len(ordered) else self.text_range[1]
+        self.functions[t] = {"entry": t, "name": f"PTR_{t:08x}", "ranges": [[t, nxt]]}
+        self.entries.add(t)
+
+    def analyze(self, e):
+        """Decodes entry e by its control flow (FunctionTranslator.decode) once and caches: the instruction
+        addresses, why it cannot be code (None if it can), the .text addresses it calls or jumps to outside its
+        own instructions, the switch tables recovered while decoding it, and the immediates its instructions
+        carry (addresses it takes as values, e.g. `mov edx, offset table`). Decoding depends only on Ghidra's
+        entries and the jump tables, so adding or dropping other entries never invalidates it."""
+        if e not in self._analysis:
+            tlo, thi = self.text_range
+            tables = set(self.jumptables)
+            ft = FunctionTranslator(self, self.functions[e])
+            insns = ft.decode()
+            addrs = {i.address for i in insns}
+            bad = next((i for i in insns if not_user_code(i)), None)
+            why = (f"{bad.mnemonic} {bad.op_str} at {bad.address:08x}" if bad
+                   else f"no valid instruction at {ft.undecodable[0]:08x}" if ft.undecodable else None)
+            targets, consts = set(), set()
+            for i in insns:
+                for o in i.operands:
+                    if o.type == CS_OP_IMM:
+                        consts.add(o.imm & 0xffffffff)
+                m, op = i.mnemonic, (i.operands[0] if i.operands else None)
+                if op is None or op.type != CS_OP_IMM:
+                    continue
+                t = op.imm & 0xffffffff
+                branch = m == "jmp" or (m.startswith("j") and m[1:] in COND) or m in ("jecxz", "jcxz", "loop", "loope",
+                                                                                     "loopne")
+                if tlo <= t < thi and (m == "call" or (branch and t not in addrs)):
+                    targets.add(t)
+            self._analysis[e] = (addrs, why, targets, set(self.jumptables) - tables, consts)
+        return self._analysis[e]
+
+    def settle(self):
+        """Alternates discovery along control flow (close_over_flow) and rejection of data (reject_non_code)
+        until neither changes anything, then does the same once more after adding the targets of pointer
+        tables at unaligned addresses."""
+        while self.close_over_flow() + self.reject_non_code():
+            pass
+        if self.add_unaligned_tables():
+            while self.close_over_flow() + self.reject_non_code():
+                pass
+
+    def close_over_flow(self):
+        """Makes every address a direct call reaches, and every address a direct jump reaches outside the
+        function it is in, an entry of its own. Decoding follows real control flow, so this finds what
+        add_pointer_entries' linear scan misses (e.g. `call` past a `jmp`). Returns the number added."""
+        added, todo = 0, sorted(self.entries)
+        while todo:
+            new = set()
+            for e in todo:
+                new |= {t for t in self.analyze(e)[2] if t not in self.entries}
+            for t in sorted(new):
+                self.add_entry(t)
+            added += len(new)
+            todo = sorted(new)
+        self.flow_entries += added
+        return added
+
+    def reject_non_code(self):
+        """Drops entries that are not Ghidra's whose code reaches bytes that are no instruction, or an
+        instruction compiled user-mode code never contains (not_user_code), or that call or jump to such an
+        entry: compiled code never branches into data, so all of them are data that looked like code. An entry
+        a Ghidra function calls or jumps to is real code and is kept. Returns the number dropped."""
+        protected = set()
+        for e in self.ghidra_entries & self.entries:
+            protected |= self.analyze(e)[2]
+        bad = {}
+        for e in sorted(self.entries - self.ghidra_entries - protected):
+            why = self.analyze(e)[1]
+            if why:
+                bad[e] = why
+        changed = True
+        while changed:
+            changed = False
+            for e in sorted(self.entries - self.ghidra_entries - protected - set(bad)):
+                hit = next((t for t in sorted(self.analyze(e)[2]) if t in bad), None)
+                if hit is not None:
+                    bad[e] = f"reaches {hit:08x} ({bad[hit]})"
+                    changed = True
+        for e, why in sorted(bad.items()):
+            self.rejected.append((e, why))
+            del self.functions[e]
+            self.entries.discard(e)
+            for t in self.analyze(e)[3]:  # switch tables recovered while decoding it
+                self.jumptables.pop(t, None)
+        return len(bad)
+
+    def add_unaligned_tables(self):
+        """Pointer tables at addresses that are not 4-byte aligned (add_pointer_entries scans aligned words
+        only): two or more consecutive dwords that all point into .text within 64 KiB of each other, at code
+        that decodes as user-mode code, where code takes as a value (an immediate, not a memory operand: constant
+        pools are read through displacements) an address at most 64 bytes before the table, its base, to which
+        it adds an index. The targets must be distinct and lie within 64 KiB of that code: a dispatch table
+        jumps into the module that indexes it, while an array of floats whose bytes, shifted, look like .text
+        addresses repeats values and points anywhere. The CRT's x87 maths dispatches through one such table to handlers that
+        nothing else reaches. Returns the number of entries added."""
+        import bisect
+        tlo, thi = self.text_range
+        rd = lambda va: int.from_bytes(self.img[va - self.base:va - self.base + 4], "little")
+        users = {}  # immediate -> entries whose code takes it as a value
+        for e in sorted(self.entries):
+            for v in self.analyze(e)[4]:
+                users.setdefault(v, []).append(e)
+        refs = sorted(users)
+
+        def used_near(k, run):
+            # code taking an address in [k - 64, k] as a value, within 64 KiB of every target
+            lo_, hi_ = bisect.bisect_left(refs, k - 64), bisect.bisect_right(refs, k)
+            return any(all(abs(t - e) < 0x10000 for t in run) for v in refs[lo_:hi_] for e in users[v])
+
+        added = []
+        for name in (".rdata", ".data"):
+            lo, hi = self.sections[name]
+            k = lo
+            while k + 8 <= hi:
+                if k % 4 == 0:
+                    k += 1
+                    continue
+                run = []
+                while k + 4 * (len(run) + 1) <= hi and tlo <= rd(k + 4 * len(run)) < thi:
+                    run.append(rd(k + 4 * len(run)))
+                if len(set(run)) >= 2 and max(run) - min(run) < 0x10000 and used_near(k, run):
+                    fresh = sorted({v for v in run if v not in self.entries})
+                    for v in fresh:
+                        self.add_entry(v)
+                    if all(self.analyze(v)[1] is None for v in fresh):
+                        added += fresh
+                        k += 4 * len(run)
+                        continue
+                    for v in fresh:  # not a table after all
+                        del self.functions[v]
+                        self.entries.discard(v)
+                k += 1
+        self.flow_entries += len(added)
+        return len(added)
 
     def add_pointer_entries(self, pe):
         """Code reached only through pointers Ghidra never turned into functions (callbacks passed as
@@ -1219,6 +1600,7 @@ class Program:
         secs = {s.Name.rstrip(b"\0").decode(): (self.base + s.VirtualAddress,
                                                  self.base + s.VirtualAddress + s.Misc_VirtualSize) for s in pe.sections}
         tlo, thi = secs[".text"]
+        self.sections, self.text_range = secs, (tlo, thi)
         jt = {t for ts in self.jumptables.values() for t in ts}
 
         def plausible(t):
@@ -1291,7 +1673,7 @@ class Program:
                     g += 1
                 if g < a and g not in self.entries:
                     insns = list(md.disasm(self.code(g, a), g, count=4))
-                    if len(insns) >= 3 or (insns and insns[-1].mnemonic in ("ret", "jmp")):
+                    if len(insns) >= 3 or (insns and (insns[-1].mnemonic in RET or insns[-1].mnemonic == "jmp")):
                         cands.add(g)
                         gaps += 1
                 # Further functions inside the same gap: MSVC pads between functions with int3 and
@@ -1300,7 +1682,7 @@ class Program:
                     if (self.img[x - 1 - self.base] == 0xCC and self.img[x - self.base] not in (0xCC, 0x90)
                             and x not in self.entries and x not in cands):
                         insns = list(md.disasm(self.code(x, a), x, count=4))
-                        if len(insns) >= 3 or (insns and insns[-1].mnemonic in ("ret", "jmp")):
+                        if len(insns) >= 3 or (insns and (insns[-1].mnemonic in RET or insns[-1].mnemonic == "jmp")):
                             cands.add(x)
                             gaps += 1
             prev_end = max(prev_end, b)
@@ -1343,7 +1725,7 @@ class Program:
                     outside = not (e <= t < span_end) or m == "call"
                     if tlo <= t < thi and outside and t not in self.entries and t not in seen:
                         cands.add(t); seen.add(t); todo.append(t)
-                if m in ("ret", "retn", "jmp", "int3"):
+                if m in RET or m in ("jmp", "int3"):
                     break
         ordered = sorted(self.entries | cands)
         for t in cands:
@@ -1384,6 +1766,17 @@ class Program:
         return seen
 
 
+def insn_runs(insns):
+    """The decoded instructions of a function as sorted, merged [start, end) address runs."""
+    runs = []
+    for i in sorted(insns, key=lambda i: i.address):
+        if runs and runs[-1][1] == i.address:
+            runs[-1][1] = i.address + i.size
+        else:
+            runs.append([i.address, i.address + i.size])
+    return runs
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("exe")
@@ -1410,9 +1803,14 @@ def main():
     unsup = Counter()
     bad_funcs = []
     chunks, cur = [], []
+    translated = []  # what was translated, in functions.json's schema, for tests/difftest.py
     for e in sorted(chosen):
+        ft = FunctionTranslator(prog, prog.functions[e])
         try:
-            src, uns, n = FunctionTranslator(prog, prog.functions[e]).translate()
+            src, uns, n = ft.translate()
+            translated.append({"entry": e, "name": prog.functions[e]["name"],
+                               "origin": "ghidra" if e in prog.ghidra_entries else "added",
+                               "ranges": insn_runs(ft.insns)})
         except Exception as ex:  # keep going; record the failure
             src = f"void f_{e:08x}(CPU *c) {{ guest_trap(c, 0x{e:08x}u, \"translator failed: {type(ex).__name__}\"); }}\n"
             uns, n = [f"translator crash: {type(ex).__name__}: {ex}"], 0
@@ -1452,6 +1850,12 @@ def main():
     stats["files"] = len(chunks)
     stats["pointer_entries"] = prog.pointer_entries
     stats["gap_entries"] = prog.gap_entries
+    stats["rejected_entries"] = len(prog.rejected)
+    stats["flow_entries"] = prog.flow_entries
+    with open(os.path.join(a.outdir, "functions_translated.json"), "w") as f:
+        json.dump({"functions": translated,
+                   "jumptables": [{"at": k, "targets": v} for k, v in sorted(prog.jumptables.items())],
+                   "rejected_entries": [{"entry": e, "why": w} for e, w in prog.rejected]}, f)
     print(json.dumps(dict(stats)))
     if unsup:
         print("unsupported by mnemonic:", unsup.most_common(25))

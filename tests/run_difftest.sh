@@ -1,6 +1,7 @@
 #!/bin/sh
 # Runs the differential tester in N parallel shards and merges the results.
 # Usage: tests/run_difftest.sh <game.exe> <functions.json> [N] [extra difftest.py args...]
+# (use out_all/functions_translated.json to cover every translated function, see difftest.py)
 # (build.sh must have built build/librecomp.dylib from the same executable)
 R=$(cd "$(dirname "$0")/.." && pwd)
 PY=${PY:-python3}

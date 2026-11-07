@@ -682,7 +682,7 @@ static void *thread_main(void *arg) {
     LOG("[kernel32] thread %x starts at %08x\n", ts->t->id, ts->start);
     PUSH32(c, ts->param);
     PUSH32(c, GUEST_RETURN_SENTINEL);
-    call_indirect(c, ts->start);
+    guest_enter(c, ts->start);
     pthread_mutex_lock(&ts->sync->m);
     ts->sync->finished = 1;
     ts->sync->exit_code = c->eax;

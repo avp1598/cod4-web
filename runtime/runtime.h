@@ -45,6 +45,9 @@ GuestFn find_import_handler(const char *name);
 extern __thread uint32_t g_import_target;  /* address of the host slot being called (set by call_indirect) */
 uint32_t guest_alloc(uint32_t size);
 void guest_call(CPU *c, GuestFn fn, int nargs, const uint32_t *args);
+/* Runs guest code from the host: the caller has pushed the arguments and GUEST_RETURN_SENTINEL. Returns once
+   the guest returns to the sentinel; control that unwinds to an address no active frame returns to traps. */
+void guest_enter(CPU *c, uint32_t target);
 void register_all_functions(void);  /* generated */
 
 /* Code created at run time (e.g. sound-engine plug-ins loaded from data files): interpreted, see interp.c */

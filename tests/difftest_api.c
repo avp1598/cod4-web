@@ -45,7 +45,9 @@ int dt_run(uint32_t addr, uint32_t *regs, uint16_t fpu_cw) {
         rc = 3;
     } else {
         setitimer(ITIMER_REAL, &tv, NULL);
-        if (setjmp(jb) == 0) fn(c);
+        /* difftest.py pushed GUEST_RETURN_SENTINEL as the return address, so this runs the function as the host
+           does: returning, or jumping, to the sentinel ends the run (as Unicorn's ends there) */
+        if (setjmp(jb) == 0) guest_enter(c, addr);
         else rc = 1;
     }
     setitimer(ITIMER_REAL, &off, NULL);

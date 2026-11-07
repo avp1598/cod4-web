@@ -17,7 +17,7 @@ uint32_t guest_stdcall(CPU *c, uint32_t fn, int nargs, const uint32_t *args) {
     uint32_t sp = c->esp;
     for (int i = nargs - 1; i >= 0; i--) PUSH32(c, args[i]);
     PUSH32(c, GUEST_RETURN_SENTINEL);
-    call_indirect(c, fn);
+    guest_enter(c, fn);
     if (c->esp != sp) {
         LOG("[user32] callback %08x left esp off by %d\n", fn, (int)(c->esp - sp));
         c->esp = sp;

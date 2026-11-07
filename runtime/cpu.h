@@ -9,6 +9,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 
 typedef union {
     float f[4];
@@ -30,10 +31,16 @@ typedef struct CPU {
     int top;          /* index of ST(0) within st[] */
     uint16_t fpu_cw;  /* control word (rounding / precision) */
     uint16_t fpu_sw;  /* status word; C0/C2/C3 written by compares */
+    uint8_t ftags;    /* x87 tags: bit p set = physical register p holds a value (clear = empty) */
     XMM xmm[8];
     uint64_t mm[8];   /* MMX registers (kept separate from the x87 stack; code issues EMMS between uses) */
     uint32_t mxcsr;
     uint32_t fs_base; /* guest address of the thread information block (fs:[0] = SEH chain) */
+    /* Where the last `ret` actually went. Each recompiled call site sets it to its own return address before
+       the call and compares after: guest code can return past its caller (a CRT routine that discards return
+       addresses, longjmp), and then each frame whose call does not return there returns too, until the one
+       whose does. Host functions never touch it, so calls into them always match. */
+    uint32_t ret_to;
     uint32_t preempt_ticks;   /* deterministic scheduling: function entries since this thread last yielded */
 } CPU;
 
@@ -210,8 +217,13 @@ DEF_RC(32, uint32_t, Regs, r)
 /* ------------------------------------------------------------------ x87 stack */
 
 #define ST(i) (c->st[(c->top + (i)) & 7])
-static inline void FPUSH(CPU *c, double v) { c->top = (c->top - 1) & 7; c->st[c->top] = v; }
-static inline double FPOP(CPU *c) { double v = c->st[c->top]; c->top = (c->top + 1) & 7; return v; }
+static inline void FPUSH(CPU *c, double v) { c->top = (c->top - 1) & 7; c->st[c->top] = v; c->ftags |= (uint8_t)(1u << c->top); }
+static inline double FPOP(CPU *c) {
+    double v = c->st[c->top];
+    c->ftags &= (uint8_t)~(1u << c->top);
+    c->top = (c->top + 1) & 7;
+    return v;
+}
 static inline void FCOM(CPU *c, double a, double b) {
     /* C3 (bit 14), C2 (bit 10), C0 (bit 8); TOP lives in bits 11-13 and is filled in by FNSTSW */
     uint16_t sw = c->fpu_sw & ~0x4500;
@@ -239,15 +251,53 @@ static inline double FDIV(CPU *c, double a, double b) {
     if (b == 0 && a == a) c->fpu_sw |= (a == 0) ? 0x0001 : 0x0004;
     return a / b;
 }
-/* fsin/fcos: out-of-range arguments (|x| >= 2^63) are left unchanged with C2 set, as on hardware */
-#define FTRIG(c, v, fn) (fabs(v) >= 9223372036854775808.0 ? ((c)->fpu_sw |= 0x0400, (v))           \
-                                                         : ((c)->fpu_sw &= ~0x0400, fn(v)))
+/* NaN results follow x86, not the host. ARM64 and WebAssembly return a positive "default NaN" where x86
+   returns the negative "real indefinite" (0xfff8000000000000 / 0xffc00000), and pick between two NaN
+   operands differently. Recompiled arithmetic tests its result for NaN (one compare, almost never taken) and
+   then recomputes it from the operands with these. */
+double x87_nan2(double a, double b);  /* x87: QNaN over SNaN, else larger significand, tie -> positive sign;
+                                         a quieted NaN operand, or the real indefinite if neither is NaN */
+double x87_nan1(double a);            /* x87 one-operand form: a quieted, or the real indefinite */
+float sse_nan2f(float a, float b);    /* SSE: the first operand if NaN, else the second, quieted; else indefinite */
+float sse_nan1f(float a);
+double sse_nan2d(double a, double b);
+double sse_nan1d(double a);
+/* x87 loads convert to the internal format, which quiets a signalling NaN; done on the bits so the compiler
+   cannot fold a float -> double -> float round trip into a copy that keeps it signalling */
+static inline double fld_f32(uint32_t u) {
+    if ((u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu)) u |= 0x00400000u;
+    float f;
+    memcpy(&f, &u, 4);
+    return (double)f;
+}
+static inline double fld_f64(uint64_t u) {
+    if ((u & 0x7ff0000000000000ull) == 0x7ff0000000000000ull && (u & 0x000fffffffffffffull)) u |= 0x0008000000000000ull;
+    double d;
+    memcpy(&d, &u, 8);
+    return d;
+}
+/* fsin/fcos: arguments with |x| >= 2^63 are left unchanged with C2 set, as on hardware; infinity is an invalid
+   operand (real indefinite, C2 clear) */
+#define FTRIG(c, v, fn) (isinf(v) ? ((c)->fpu_sw &= ~0x0400, x87_nan1(v))                          \
+                         : fabs(v) >= 9223372036854775808.0 ? ((c)->fpu_sw |= 0x0400, (v))           \
+                         : ((c)->fpu_sw &= ~0x0400, fn(v)))
+double fpu_scale(double a, double b);  /* FSCALE: a * 2^trunc(b) with x87's NaN and infinity cases */
+/* FNSAVE / FRSTOR: the 108-byte 32-bit protected-mode image (environment: control, status and tag words, then
+   the instruction and operand pointers, which the recompiled code does not track and stores as 0; then
+   ST(0)..ST(7) as 80-bit values). FNSAVE then reinitialises the FPU like FNINIT. */
+void fpu_save(CPU *c, uint32_t a);
+void fpu_restore(CPU *c, uint32_t a);
+/* SSE one-operand maths with x86 NaN results */
+static inline float sse_sqrtf(float v) { float r = sqrtf(v); return r != r ? sse_nan1f(v) : r; }
+static inline float sse_rsqrtf(float v) { float r = 1.0f / sqrtf(v); return r != r ? sse_nan1f(v) : r; }
+static inline float sse_rcpf(float v) { float r = 1.0f / v; return r != r ? sse_nan1f(v) : r; }
 /* The x87 state as recompiled functions cache it (see Regs): s[i] is ST(i), so a push or pop rotates the
    array. Every index is a constant, so the compiler keeps the eight values in registers and a rotation costs
    nothing. The control word is written through to the CPU (fpu_to_int32 and friends read it there). */
-typedef struct X87 { double s[8]; int top; uint16_t sw, cw; } X87;
+typedef struct X87 { double s[8]; int top; uint16_t sw, cw; uint8_t tags; /* bit i: ST(i) holds a value */ } X87;
 #define X87_LOAD(x, c) do {                                                                        \
         (x)->top = (c)->top & 7; (x)->sw = (c)->fpu_sw; (x)->cw = (c)->fpu_cw;                     \
+        (x)->tags = (uint8_t)(((c)->ftags >> (x)->top) | ((c)->ftags << (8 - (x)->top)));         \
         (x)->s[0] = (c)->st[(x)->top]; (x)->s[1] = (c)->st[((x)->top + 1) & 7];                    \
         (x)->s[2] = (c)->st[((x)->top + 2) & 7]; (x)->s[3] = (c)->st[((x)->top + 3) & 7];          \
         (x)->s[4] = (c)->st[((x)->top + 4) & 7]; (x)->s[5] = (c)->st[((x)->top + 5) & 7];          \
@@ -255,6 +305,7 @@ typedef struct X87 { double s[8]; int top; uint16_t sw, cw; } X87;
     } while (0)
 #define X87_STORE(x, c) do {                                                                       \
         (c)->top = (x)->top; (c)->fpu_sw = (x)->sw;                                                \
+        (c)->ftags = (uint8_t)(((x)->tags << (x)->top) | ((x)->tags >> (8 - (x)->top)));         \
         (c)->st[(x)->top] = (x)->s[0]; (c)->st[((x)->top + 1) & 7] = (x)->s[1];                    \
         (c)->st[((x)->top + 2) & 7] = (x)->s[2]; (c)->st[((x)->top + 3) & 7] = (x)->s[3];          \
         (c)->st[((x)->top + 4) & 7] = (x)->s[4]; (c)->st[((x)->top + 5) & 7] = (x)->s[5];          \
@@ -264,12 +315,14 @@ RC_INLINE void FPUSHx(X87 *x, double v) {
     x->s[7] = x->s[6]; x->s[6] = x->s[5]; x->s[5] = x->s[4]; x->s[4] = x->s[3];
     x->s[3] = x->s[2]; x->s[2] = x->s[1]; x->s[1] = x->s[0]; x->s[0] = v;
     x->top = (x->top - 1) & 7;
+    x->tags = (uint8_t)(x->tags << 1 | 1);
 }
 RC_INLINE double FPOPx(X87 *x) {   /* the popped value stays in its physical register, now ST(7) */
     double v = x->s[0];
     x->s[0] = x->s[1]; x->s[1] = x->s[2]; x->s[2] = x->s[3]; x->s[3] = x->s[4];
     x->s[4] = x->s[5]; x->s[5] = x->s[6]; x->s[6] = x->s[7]; x->s[7] = v;
     x->top = (x->top + 1) & 7;
+    x->tags >>= 1;   /* the popped register, now ST(7), is empty */
     return v;
 }
 RC_INLINE void FCOMx(X87 *x, double a, double b) {
@@ -285,12 +338,27 @@ RC_INLINE double FDIVx(X87 *x, double a, double b) {
     if (b == 0 && a == a) x->sw |= (a == 0) ? 0x0001 : 0x0004;
     return a / b;
 }
-#define FTRIGx(x, v, fn) (fabs(v) >= 9223372036854775808.0 ? ((x)->sw |= 0x0400, (v)) \
-                                                         : ((x)->sw &= ~0x0400, fn(v)))
+#define FTRIGx(x, v, fn) (isinf(v) ? ((x)->sw &= ~0x0400, x87_nan1(v))                         \
+                          : fabs(v) >= 9223372036854775808.0 ? ((x)->sw |= 0x0400, (v))            \
+                          : ((x)->sw &= ~0x0400, fn(v)))
 double RF80(uint32_t a);            /* load an 80-bit extended value */
 void WF80(uint32_t a, double v);    /* store as 80-bit extended */
-int32_t fpu_to_int32(CPU *c, double v);  /* honours the rounding mode in fpu_cw */
+/* x87 integer stores. Values outside the destination's range (and NaN) give its "integer indefinite":
+   the most negative value. fpu_to_* round per the control word; fpu_trunc_to_* (fisttp) always truncate. */
+int16_t fpu_to_int16(CPU *c, double v);
+int32_t fpu_to_int32(CPU *c, double v);
 int64_t fpu_to_int64(CPU *c, double v);
+int16_t fpu_trunc_to_int16(double v);
+int32_t fpu_trunc_to_int32(double v);
+int64_t fpu_trunc_to_int64(double v);
+/* SSE conversions. They round per MXCSR (bits 13-14), which is independent of the x87 control word the host
+   FPU mirrors, so neither depends on the host rounding mode. sse_to_int32: NaN and out-of-range give
+   0x80000000; truncate = 1 for the cvtt* forms. */
+int32_t sse_to_int32(uint32_t mxcsr, double v, int truncate);
+float sse_int_to_float(uint32_t mxcsr, int32_t v);
+/* Segment selectors as `mov r/m, Sreg` reads them, indexed by the x86 Sreg encoding (es, cs, ss, ds, fs,
+   gs). runtime.c sets 32-bit Windows' values; the differential tester sets its emulator's. */
+extern uint16_t g_seg_selector[6];
 double fpu_round(CPU *c, double v);      /* FRNDINT */
 /* The x87 rounding-control bits (CW 10-11) are mirrored into the host FPU's rounding mode, so float
    stores, precision rounding and arithmetic round like the original (the game uses "chop" mode for

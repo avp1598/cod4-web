@@ -18,9 +18,11 @@ FPFLAGS="-frounding-math"  # the x87 rounding mode is mirrored into the host FPU
 if [ "${TRACE:-0}" = 1 ]; then OUT=out_trace; OBJ=obj_trace; LIB=librecomp_trace.dylib; TFLAG=--trace
 else OUT=out_all; OBJ=obj_all; LIB=librecomp.dylib; TFLAG=; fi
 export OUT OBJ  # used inside the per-file compile command below
-
-"$PY" -I "$R/translator/x86toc.py" "$EXE" "$FUNCS" "$R/$OUT" --all --per-file 300 $TFLAG | head -1
 mkdir -p "$R/build/$OBJ"
+
+# The translator's first output line is its summary; run it to a log so a failure stops the build
+"$PY" -I "$R/translator/x86toc.py" "$EXE" "$FUNCS" "$R/$OUT" --all --per-file 300 $TFLAG > "$R/build/translate.log"
+head -1 "$R/build/translate.log"
 cd "$R"
 ls $OUT/*.c | while read f; do
     b=$(basename "$f" .c)
