@@ -2,7 +2,7 @@
 # Translates a Windows executable to C and builds it natively (macOS):
 #   ./build.sh <game.exe> <functions.json>     (functions.json: see ghidra/export.sh)
 # -> build/librecomp.dylib (the recompiled code, for tests/difftest.py) and build/recomp (the launcher).
-# Only generated files whose content changed are recompiled. TRACE=1 builds build/librecomp_trace.dylib
+# Only generated files whose content (or included headers, or flags) changed are recompiled. TRACE=1 builds build/librecomp_trace.dylib
 # instead (every instruction calls trace_insn). PROFILE=path/to/profile.h picks the game profile
 # (default host/profile.h). PY, WGPU and SDL2 override the Python, wgpu-native and SDL2 locations.
 set -e
@@ -24,9 +24,11 @@ mkdir -p "$R/build/$OBJ"
 "$PY" -I "$R/translator/x86toc.py" "$EXE" "$FUNCS" "$R/$OUT" --all --per-file 300 $TFLAG > "$R/build/translate.log"
 head -1 "$R/build/translate.log"
 cd "$R"
+# the headers the generated code includes (inline helpers, macros) are part of every file's cache key
+HDR=$(cat runtime/*.h $OUT/*.h | shasum | cut -c1-40)
 ls $OUT/*.c | while read f; do
     b=$(basename "$f" .c)
-    h=$( (cat "$f"; echo "$OPT $FPFLAGS") | shasum | cut -c1-40)  # flags are part of the cache key
+    h=$( (cat "$f"; echo "$OPT $FPFLAGS $HDR") | shasum | cut -c1-40)  # flags and headers are part of the key
     if [ ! -f "build/$OBJ/$b.o" ] || [ "$(cat "build/$OBJ/$b.hash" 2>/dev/null)" != "$h" ]; then
         echo "$f $b $h"
     fi

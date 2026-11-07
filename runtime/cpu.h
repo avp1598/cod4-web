@@ -245,12 +245,34 @@ RC_INLINE void FCOMIr(Regs *c, double a, double b) {
 static inline uint16_t FNSTSW(CPU *c) { return (uint16_t)((c->fpu_sw & ~0x3800) | ((c->top & 7) << 11)); }
 /* Precision control (FPU CW bits 8-9). Direct3D 8 switches the FPU to 24-bit precision unless the
    device is created with D3DCREATE_FPU_PRESERVE, so honouring it matters for matching the game. */
-static inline double FPRES(CPU *c, double v) { return ((c->fpu_cw >> 8) & 3) == 0 ? (double)(float)v : v; }
-/* Division, setting the sticky status flags code can read back with FNSTSW: ZE for x/0, IE for 0/0. */
+/* 24-bit precision control rounds the significand to 24 bits (in the rounding control's direction) and keeps
+   the full exponent range (Intel SDM Vol. 1 §8.1.5.2): a float conversion is that only inside float's normal
+   range, so a value outside it is first scaled there by a power of two (exact), and NaNs are left as they are. */
+static inline double fpu_round24(double v) {
+    double a = fabs(v);
+    if (a >= 0x1p-126 && a < 0x1p127) return (double)(float)v;   /* rounding can reach 2^127, not overflow */
+    if (a == 0 || a != a || a == INFINITY) return v;
+    int e;
+    double m = frexp(v, &e);                                     /* v = m * 2^e, 0.5 <= |m| < 1 */
+    return ldexp((double)(float)m, e);
+}
+static inline double FPRES(CPU *c, double v) { return ((c->fpu_cw >> 8) & 3) == 0 ? fpu_round24(v) : v; }
+/* Sticky exception flags code reads back with FNSTSW, as the hardware sets them with the exceptions masked
+   (Intel SDM Vol. 1 §8.5): IE (0x0001) for an invalid operation, ZE (0x0004) for a finite nonzero value
+   divided by zero. Division sets IE for 0/0 and inf/inf, and nothing for inf/0 or a quiet NaN operand. Not
+   modelled anywhere: DE, OE, UE and PE, IE for signalling NaN operands of arithmetic (memory operands are
+   quieted as they are loaded), and IE for invalid operations other than division and FYL2X. */
+static inline uint16_t fdiv_flags(double a, double b) {
+    if (b == 0) return a == 0 ? 0x0001 : isfinite(a) ? 0x0004 : 0;
+    return isinf(a) && isinf(b) ? 0x0001 : 0;
+}
 static inline double FDIV(CPU *c, double a, double b) {
-    if (b == 0 && a == a) c->fpu_sw |= (a == 0) ? 0x0001 : 0x0004;
+    c->fpu_sw |= fdiv_flags(a, b);
     return a / b;
 }
+/* FYL2X: y * log2(x) with the hardware's special cases and flags (see fdiv_flags) */
+double fpu_yl2x(double y, double x, uint16_t *sw);
+static inline double FYL2X(CPU *c, double y, double x) { return fpu_yl2x(y, x, &c->fpu_sw); }
 /* NaN results follow x86, not the host. ARM64 and WebAssembly return a positive "default NaN" where x86
    returns the negative "real indefinite" (0xfff8000000000000 / 0xffc00000), and pick between two NaN
    operands differently. Recompiled arithmetic tests its result for NaN (one compare, almost never taken) and
@@ -333,11 +355,12 @@ RC_INLINE void FCOMx(X87 *x, double a, double b) {
     x->sw = sw;
 }
 RC_INLINE uint16_t FNSTSWx(const X87 *x) { return (uint16_t)((x->sw & ~0x3800) | ((x->top & 7) << 11)); }
-RC_INLINE double FPRESx(const X87 *x, double v) { return ((x->cw >> 8) & 3) == 0 ? (double)(float)v : v; }
+RC_INLINE double FPRESx(const X87 *x, double v) { return ((x->cw >> 8) & 3) == 0 ? fpu_round24(v) : v; }
 RC_INLINE double FDIVx(X87 *x, double a, double b) {
-    if (b == 0 && a == a) x->sw |= (a == 0) ? 0x0001 : 0x0004;
+    x->sw |= fdiv_flags(a, b);
     return a / b;
 }
+RC_INLINE double FYL2Xx(X87 *x, double y, double v) { return fpu_yl2x(y, v, &x->sw); }
 #define FTRIGx(x, v, fn) (isinf(v) ? ((x)->sw &= ~0x0400, x87_nan1(v))                         \
                           : fabs(v) >= 9223372036854775808.0 ? ((x)->sw |= 0x0400, (v))            \
                           : ((x)->sw &= ~0x0400, fn(v)))

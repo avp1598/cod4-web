@@ -10,16 +10,28 @@ Usage: difftest.py <exe> <functions.json> <build/librecomp.dylib> [--max N] [--t
 Pass the translator's out_all/functions_translated.json as <functions.json> to test exactly the functions
 that were translated (Ghidra's plus the entries the translator found itself), with the instruction ranges
 it decoded.
+
+Outcomes, per function over all its trials:
+  fail      some trial differs (registers or memory), or the recompiled code trapped or did not return
+  pass      every trial that could run on both sides matched (the reason names any trial that could not)
+  nan       as pass, except NaN bit patterns differ
+  fp_range  fails, but passes on inputs of moderate magnitude: values beyond the double exponent range
+  x87_ext   fails, but every failing trial matches when the emulator holds its x87 registers at double
+            precision as the recompiled code does (tests/x87ref.py): the 80-bit precision the model drops
+  skip      no trial could run to the end in the emulator (the reason says why), or not selected
+The emulator's x87 is corrected where it departs from the hardware (tests/x87ref.py).
 """
 import argparse
 import ctypes
 import json
+import os
 import random
 import struct
 import sys
 
 import pefile
-from unicorn import x86_const as unicorn_x86
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # run with -I: this directory is not on the path
+import x87ref  # noqa: E402
 from capstone import CS_ARCH_X86, CS_MODE_32, CS_OP_IMM, CS_OP_MEM, Cs
 from unicorn import UC_PROT_READ, UC_PROT_WRITE, UC_ARCH_X86, UC_HOOK_CODE, UC_HOOK_INSN, UC_HOOK_MEM_FETCH_UNMAPPED, UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_WRITE, \
     UC_HOOK_MEM_WRITE_UNMAPPED, UC_MODE_32, Uc, UcError
@@ -102,7 +114,6 @@ def pick_functions(prog_img, base, funcs, jumptables, allow_calls=False):
 class Tester:
     def __init__(self, exe, lib, fpu_cw=FPU_CW):
         self.fpu_cw = fpu_cw
-        self.fsave_sites = []  # set by find_fsave_sites
         self.lib = ctypes.CDLL(lib)
         self.lib.dt_mem.restype = ctypes.c_void_p
         self.lib.dt_trap_msg.restype = ctypes.c_char_p
@@ -118,6 +129,7 @@ class Tester:
         # Snapshot the loaded image from the C side (it includes the patched import table).
         self.image = ctypes.string_at(self.mem + self.base, self.size)
         self.tib = ctypes.string_at(self.mem + TIB, PAGE)
+        self.corrections = x87ref.Corrections(self.image, self.base, TIB)   # sites: find_correction_sites
         # rdtsc makes a run nondeterministic (games often seed their RNG with it): find every occurrence
         # (byte pattern 0F 31; a false match only turns a test into a skip)
         self.rdtsc_sites = []
@@ -131,37 +143,9 @@ class Tester:
                 self.rdtsc_sites.append(self.base + lo + k)
                 k = text.find(b"\x0f\x31", k + 1)
 
-    # FNSAVE/FNSTENV images: the recompiled code does not model the x87 instruction and operand pointers (FIP,
-    # FCS/FOP, FDP, FDS; only exception reporting reads them) and stores 0 there; QEMU stores the last x87
-    # instruction's address in FIP and zeros the rest. QEMU also leaves the reserved upper halves of the control,
-    # status and tag words 0 where the hardware sets them to 1 (the 80486 does, per Linux's math-emu; Bochs does
-    # the same). After each such instruction the emulator's image is brought to the modelled one.
-    def find_fsave_sites(self, exe_funcs):
-        md = Cs(CS_ARCH_X86, CS_MODE_32)
-        sites = set()
-        for f in exe_funcs:
-            for a, b in f["ranges"]:
-                for ins in md.disasm(self.image[a - self.base:b - self.base], a):
-                    if ins.mnemonic in ("fnsave", "fsave", "fnstenv", "fstenv"):
-                        sites.add((ins.address, ins.size))
-        self.fsave_sites = sorted(sites)
-
-    def fsave_hook(self, uc, addr, size, data):
-        isize, pending = data
-        md = Cs(CS_ARCH_X86, CS_MODE_32)
-        md.detail = True
-        ins = next(md.disasm(bytes(uc.mem_read(addr, isize)), addr, count=1))
-        m = ins.operands[0].mem
-        reg = lambda r: uc.reg_read(getattr(unicorn_x86, f"UC_X86_REG_{ins.reg_name(r).upper()}")) if r else 0
-        pending.append((reg(m.base) + reg(m.index) * m.scale + m.disp) & 0xffffffff)
-
-    @staticmethod
-    def fsave_fixup(uc, addr, size, pending):
-        while pending:
-            ea = pending.pop()
-            for k in (2, 6, 10):
-                uc.mem_write(ea + k, b"\xff\xff")
-            uc.mem_write(ea + 12, bytes(16))
+    def find_correction_sites(self, exe_funcs):
+        """The instructions whose emulation tests/x87ref.py corrects, in the translated functions' code."""
+        self.corrections.find_sites(exe_funcs)
 
     def cwrite(self, addr, data):
         ctypes.memmove(self.mem + addr, data, len(data))
@@ -184,8 +168,11 @@ class Tester:
         regs = [small(), ptr(), ptr(), small(), esp, ptr(), ptr(), ptr()]
         return scratch, stack, regs
 
-    def run_unicorn(self, entry, scratch, stack, regs, code_hook=None, write_hook=None):
+    def run_unicorn(self, entry, scratch, stack, regs, code_hook=None, write_hook=None, double_model=False):
+        """double_model: hold the x87 registers at double precision, as the recompiled code does (x87_ext)."""
         uc = Uc(UC_ARCH_X86, UC_MODE_32)
+        if double_model:   # first, so the other hooks of an instruction see the registers as the model holds them
+            uc.hook_add(UC_HOOK_CODE, x87ref.hold_as_doubles)
         if code_hook:
             uc.hook_add(UC_HOOK_CODE, code_hook)
         if write_hook:
@@ -206,7 +193,6 @@ class Tester:
         uc.mem_map(TIB, PAGE)
         uc.mem_write(TIB, self.tib)
         demand = []
-        pending = []
 
         def on_unmapped(uc_, access, addr, size, value, data):
             if access == UC_HOOK_MEM_FETCH_UNMAPPED or addr == SENTINEL:
@@ -235,9 +221,7 @@ class Tester:
             uc.reg_write(r, v)
         uc.reg_write(UC_X86_REG_FPCW, self.fpu_cw)
         uc.reg_write(UC_X86_REG_FPTAG, 0xFFFF)  # every register empty, as a Windows thread starts (and the C side)
-        for a, size in self.fsave_sites:
-            uc.hook_add(UC_HOOK_CODE, self.fsave_hook, (size, pending), begin=a, end=a)
-            uc.hook_add(UC_HOOK_CODE, self.fsave_fixup, pending, begin=a + size, end=a + size)
+        self.corrections.install(uc)
         uc.reg_write(UC_X86_REG_EFLAGS, 0x202)  # user-mode Windows: IF set
         try:
             uc.emu_start(entry, SENTINEL, timeout=2_000_000, count=2_000_000)
@@ -253,13 +237,19 @@ class Tester:
         return uc, None, demand
 
     def run(self, f, trials, seed):
-        status, why = self.run_mode(f, trials, seed, sane=False)
-        if status == "fpu_flags":
-            return status, why
-        if status == "fail" and self.uses_fp(f) and "trap" not in why and "watchdog" not in why:
-            s2, _ = self.run_mode(f, trials, seed, sane=True)
-            if s2 in ("pass", "nan"):
+        """The function's outcome over all trials (see combine), with float-only differences classified."""
+        outs = self.run_mode(f, trials, seed, sane=False)
+        status, why = combine(outs, trials)
+        failed = [t for t, (s, w) in enumerate(outs) if s == "fail"]
+        if failed and self.uses_fp(f) and not any("trap" in outs[t][1] or "watchdog" in outs[t][1] for t in failed):
+            if combine(self.run_mode(f, trials, seed, sane=True), trials)[0] in ("pass", "nan"):
                 return "fp_range", why  # differs only for magnitudes beyond the double exponent range
+            # The same inputs again, with the emulator's x87 registers held at double precision as the recompiled
+            # code's are. If every failing trial then matches, and no trial fails, the difference is the extended
+            # precision the model does not keep (80-bit constants and loads, results at 64-bit precision control)
+            dm = self.run_mode(f, trials, seed, sane=False, double_model=True)
+            if all(dm[t][0] in ("pass", "nan") for t in failed) and not any(s == "fail" for s, _ in dm):
+                return "x87_ext", why
         return status, why
 
     def uses_fp(self, f):
@@ -270,56 +260,73 @@ class Tester:
                     return True
         return False
 
-    def run_mode(self, f, trials, seed, sane):
+    def run_mode(self, f, trials, seed, sane, double_model=False):
+        """(status, reason) of each trial: pass, nan (only NaN bit patterns differ), fail or skip."""
+        return [self.run_trial(f, t, seed, sane, double_model) for t in range(trials)]
+
+    def run_trial(self, f, t, seed, sane, double_model):
         entry = f["entry"]
         nan_only = False
-        for t in range(trials):
-            rng = random.Random(seed * 1000003 + entry * 31 + t + (7777 if sane else 0))
-            scratch, stack, regs = self.setup_state(rng, sane)
-            uc, err, demand = self.run_unicorn(entry, scratch, stack, regs)
-            if uc is None:
-                return "skip", err
-            # C side from the identical state
-            for k, r in enumerate(SREGS):
-                self.selectors[k] = uc.reg_read(r)
-            self.cwrite(self.base, self.image)
-            self.cwrite(SCRATCH, scratch)
-            self.cwrite(STACK_LO, bytes(STACK_HI - STACK_LO))
-            self.cwrite(TIB, self.tib)
-            self.cwrite(GDT, GDT_PAGE)
-            self.cwrite(regs[4], stack)
-            for p in demand:
-                self.cwrite(p, bytes(PAGE))
-            cregs = (ctypes.c_uint32 * 8)(*regs)
-            rc = self.lib.dt_run(entry, cregs, self.fpu_cw)
-            if rc == 1:
-                return "fail", f"trap {self.lib.dt_trap_msg().decode()}"
-            if rc == 2:
-                return "skip", "not recompiled"
-            if rc == 3:
-                return "fail", f"trial {t}: recompiled code did not return (watchdog)"
-            for i, r in enumerate(REGS):
-                u = uc.reg_read(r)
-                if u != cregs[i] and nan_word(u.to_bytes(4, "little"), cregs[i].to_bytes(4, "little"), 0):
+        rng = random.Random(seed * 1000003 + entry * 31 + t + (7777 if sane else 0))
+        scratch, stack, regs = self.setup_state(rng, sane)
+        uc, err, demand = self.run_unicorn(entry, scratch, stack, regs, double_model=double_model)
+        if uc is None:
+            return "skip", err
+        # C side from the identical state
+        for k, r in enumerate(SREGS):
+            self.selectors[k] = uc.reg_read(r)
+        self.cwrite(self.base, self.image)
+        self.cwrite(SCRATCH, scratch)
+        self.cwrite(STACK_LO, bytes(STACK_HI - STACK_LO))
+        self.cwrite(TIB, self.tib)
+        self.cwrite(GDT, GDT_PAGE)
+        self.cwrite(regs[4], stack)
+        for p in demand:
+            self.cwrite(p, bytes(PAGE))
+        cregs = (ctypes.c_uint32 * 8)(*regs)
+        rc = self.lib.dt_run(entry, cregs, self.fpu_cw)
+        if rc == 1:
+            return "fail", f"trap {self.lib.dt_trap_msg().decode()}"
+        if rc == 2:
+            return "skip", "not recompiled"
+        if rc == 3:
+            return "fail", f"trial {t}: recompiled code did not return (watchdog)"
+        for i, r in enumerate(REGS):
+            u = uc.reg_read(r)
+            if u != cregs[i] and nan_word(u.to_bytes(4, "little"), cregs[i].to_bytes(4, "little"), 0):
+                nan_only = True
+            elif u != cregs[i]:
+                return "fail", f"trial {t}: {NAMES[i]} unicorn={u:08x} recomp={cregs[i]:08x}"
+        regions = [(self.base, self.size), (SCRATCH, SCRATCH_SIZE), (STACK_LO, STACK_HI - STACK_LO), (TIB, PAGE), (GDT, PAGE)]
+        regions += [(p, PAGE) for p in demand]
+        for a, n in regions:
+            um, cm = bytes(uc.mem_read(a, n)), self.cread(a, n)
+            if um != cm:
+                diffs = [i for i in range(n) if um[i] != cm[i]]
+                if all(nan_word(um, cm, i) for i in diffs):
                     nan_only = True
-                elif u != cregs[i] and (u ^ cregs[i]) & ~0x3f == 0 and NAMES[i] == "eax" and self.uses_fp(f):
-                    # x87 exception bits read back with FNSTSW. QEMU (inside Unicorn) raises ZE whenever the
-                    # divisor is zero, even for 0/0, where hardware raises only IE as the recompiled code does.
-                    return "fpu_flags", f"trial {t}: {NAMES[i]} unicorn={u:08x} recomp={cregs[i]:08x}"
-                elif u != cregs[i]:
-                    return "fail", f"trial {t}: {NAMES[i]} unicorn={u:08x} recomp={cregs[i]:08x}"
-            regions = [(self.base, self.size), (SCRATCH, SCRATCH_SIZE), (STACK_LO, STACK_HI - STACK_LO), (TIB, PAGE), (GDT, PAGE)]
-            regions += [(p, PAGE) for p in demand]
-            for a, n in regions:
-                um, cm = bytes(uc.mem_read(a, n)), self.cread(a, n)
-                if um != cm:
-                    diffs = [i for i in range(n) if um[i] != cm[i]]
-                    if all(nan_word(um, cm, i) for i in diffs):
-                        nan_only = True
-                        continue
-                    k = next(i for i in diffs if not nan_word(um, cm, i))
-                    return "fail", f"trial {t}: memory differs at {a + k:08x} (unicorn {um[k]:02x}, recomp {cm[k]:02x})"
+                    continue
+                k = next(i for i in diffs if not nan_word(um, cm, i))
+                return "fail", f"trial {t}: memory differs at {a + k:08x} (unicorn {um[k]:02x}, recomp {cm[k]:02x})"
         return ("nan", "only NaN bit patterns differ") if nan_only else ("pass", None)
+
+
+def combine(outs, trials):
+    """One outcome from the trials': fail if any trial failed (its reason); otherwise pass, or nan if only NaN bit
+    patterns differed, when at least one trial ran to the end on both sides (the reason then names the trials
+    that could not run); skip if none could."""
+    for t, (s, why) in enumerate(outs):
+        if s == "fail":
+            return "fail", why if why.startswith("trial") else f"trial {t}: {why}"
+    compared = [s for s, _ in outs if s in ("pass", "nan")]
+    skipped = [(t, why) for t, (s, why) in enumerate(outs) if s == "skip"]
+    if not compared:
+        return "skip", skipped[0][1]
+    status = "nan" if "nan" in compared else "pass"
+    notes = ["only NaN bit patterns differ"] if status == "nan" else []
+    if skipped:
+        notes.append(f"{len(compared)}/{trials} trials compared; trial {skipped[0][0]} skipped: {skipped[0][1]}")
+    return status, "; ".join(notes) or None
 
 
 def cpuid_hook(uc, data):
@@ -362,7 +369,7 @@ def main():
 
     tester = Tester(a.exe, a.lib, int(a.fpu_cw, 16))
     d = json.load(open(a.functions_json))
-    tester.find_fsave_sites([f for f in d["functions"] if f["ranges"]])
+    tester.find_correction_sites([f for f in d["functions"] if f["ranges"]])
     jumptables = {j["at"] for j in d["jumptables"]}
     funcs = [f for f in d["functions"] if f["ranges"]]
     filtered = []
@@ -377,7 +384,7 @@ def main():
         funcs = funcs[k::n]
         filtered = filtered[k::n]
     print(f"testing {len(funcs)} functions x {a.trials} trials ({len(filtered)} not selected)", flush=True)
-    results = {"pass": [], "nan": [], "fp_range": [], "fpu_flags": [], "fail": [], "skip": []}
+    results = {"pass": [], "nan": [], "fp_range": [], "x87_ext": [], "fail": [], "skip": []}
     for f, why in filtered:
         results["skip"].append((f"0x{f['entry']:08x}", f["name"], f"not selected: {why}"))
     for i, f in enumerate(funcs):

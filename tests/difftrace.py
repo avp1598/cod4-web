@@ -65,7 +65,7 @@ def main():
     entry = int(a.entry, 16)
     t = Tester(a.exe, a.lib, int(a.fpu_cw, 16))
     import json
-    t.find_fsave_sites([f for f in json.load(open(a.functions_json))["functions"] if f["ranges"]])
+    t.find_correction_sites([f for f in json.load(open(a.functions_json))["functions"] if f["ranges"]])
     md = Cs(CS_ARCH_X86, CS_MODE_32)
 
     def dis(addr):

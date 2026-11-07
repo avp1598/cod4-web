@@ -237,6 +237,25 @@ double x87_nan2(double a, double b) {
 
 double sse_nan1d(double a) { return x87_nan1(a); }
 
+/* Intel SDM Vol. 2A, FYL2X, table "FYL2X Results": an operation with no defined result (x < 0; x = +-0 with
+   y = +-0; x = +inf with y = +-0; x = +1 with y = +-inf) raises IE and gives the real indefinite; x = +-0 with
+   a finite nonzero y raises ZE and gives an infinity of the sign opposite to y's. The remaining special cases
+   (x = +-0 with an infinite y; x = +inf, x = +1, x off 1 with an infinite y) are what y * log2(x) gives. NaN
+   operands follow the x87 NaN rules; a signalling one raises IE. */
+double fpu_yl2x(double y, double x, uint16_t *sw) {
+    if (x != x || y != y) {
+        if ((x != x && !(bits_of(x) & QUIET64)) || (y != y && !(bits_of(y) & QUIET64))) *sw |= 0x0001;
+        return x87_nan2(y, x);
+    }
+    double r = y * log2(x);
+    if (r != r) {
+        *sw |= 0x0001;
+        return double_of(INDEFINITE64);
+    }
+    if (x == 0 && y != 0 && isfinite(y)) *sw |= 0x0004;
+    return r;
+}
+
 double sse_nan2d(double a, double b) {
     if (a != a) return double_of(bits_of(a) | QUIET64);
     if (b != b) return double_of(bits_of(b) | QUIET64);
@@ -319,7 +338,19 @@ double RF80(uint32_t a) {
     int sign = se >> 15, exp = se & 0x7fff;
     double v;
     if (exp == 0 && mant == 0) v = 0.0;
-    else if (exp == 0x7fff) v = (mant << 1) ? NAN : INFINITY;
+    else if (exp == 0x7fff) {
+        uint64_t frac = mant & 0x7fffffffffffffffull;
+        if (!frac) {
+            v = INFINITY;
+        } else {
+            /* a NaN keeps its sign, quiet bit and the top 51 payload bits a double holds. A signalling NaN
+               whose payload lies only in the low bits a double cannot hold is kept as quiet (with no payload
+               left, a double with that sign and exponent would be an infinity). */
+            uint64_t f = frac >> 11;
+            if (!f) f = QUIET64;
+            return double_of(((uint64_t)sign << 63) | 0x7ff0000000000000ull | f);
+        }
+    }
     else v = ldexp((double)mant, exp - 16383 - 63);
     return sign ? -v : v;
 }
@@ -328,7 +359,7 @@ void WF80(uint32_t a, double v) {
     uint16_t se = signbit(v) ? 0x8000 : 0;
     uint64_t mant = 0;
     v = fabs(v);
-    if (isnan(v)) { se |= 0x7fff; mant = 0xc000000000000000ull; }
+    if (isnan(v)) { se |= 0x7fff; mant = 0x8000000000000000ull | (bits_of(v) & 0x000fffffffffffffull) << 11; }
     else if (isinf(v)) { se |= 0x7fff; mant = 0x8000000000000000ull; }
     else if (v != 0) {
         int e;

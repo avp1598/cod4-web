@@ -109,7 +109,7 @@ _REWRITES = [
 # x87 (statements that move the stack top directly, finit/fincstp/fdecstp, run on the CPU struct instead)
 _X87_REWRITES = [
     (re.compile(r"\bST\((\d)\)"), r"x->s[\1]"),
-    (re.compile(r"\b(FPUSH|FCOM|FPRES|FDIV|FTRIG)\(c,"), r"\1x(x,"),
+    (re.compile(r"\b(FPUSH|FCOM|FPRES|FDIV|FYL2X|FTRIG)\(c,"), r"\1x(x,"),
     (re.compile(r"\b(FPOP|FNSTSW)\(c\)"), r"\1x(x)"),
     (re.compile(r"\bc->fpu_sw\b"), "x->sw"),
     (re.compile(r"\bc->fpu_cw = "), "x->cw = C->fpu_cw = "),   # written through (fldcw)
@@ -126,7 +126,7 @@ _WRITES = [   # (pattern, bits, or a function of the match giving the bits)
      lambda m: CBIT[m.group(1) or m.group(2) or m.group(3)]),
     (re.compile(r"\b" + _FLAG_HELPERS + r"r\(r,|\bFCOMIr\(r,"), FLAG_BITS),
     (re.compile(r"\bPUSH32r\(r,|\bPOP32r\(r\)"), CBIT["esp"]),
-    (re.compile(r"\bx->(?:s\[\d\]|top|sw|tags)" + _ASSIGN + r"|\b(?:FPUSHx|FPOPx|FCOMx|FDIVx|FTRIGx)\(x"), X87_BIT),
+    (re.compile(r"\bx->(?:s\[\d\]|top|sw|tags)" + _ASSIGN + r"|\b(?:FPUSHx|FPOPx|FCOMx|FDIVx|FYL2Xx|FTRIGx)\(x"), X87_BIT),
     (re.compile(r"\bV_\[(\d)\](?:\.\w+(?:\[\d+\])?)?" + _ASSIGN + r"|\bmem(?:cpy|set)\((?:\(uint8_t \*\))?V_\[(\d)\]"),
      lambda m: XMM_BIT[int(m.group(1) or m.group(2))]),
     (re.compile(r"\bmem(?:cpy|set)\((?:\(uint8_t \*\))?&M_\[(\d)\]"), lambda m: MM_BIT[int(m.group(1))]),
@@ -1001,8 +1001,7 @@ class FunctionTranslator:
             return ("{ double a_ = ST(1), b_ = ST(0), r_ = atan2(a_, b_); if (r_ != r_) r_ = x87_nan2(a_, b_); "
                     "ST(1) = r_; FPOP(c); }")
         if m == "fyl2x":
-            return ("{ double a_ = ST(1), b_ = ST(0), r_ = a_ * log2(b_); if (r_ != r_) r_ = x87_nan2(a_, b_); "
-                    "ST(1) = r_; FPOP(c); }")
+            return "{ double y_ = ST(1), x_ = ST(0); ST(1) = FYL2X(c, y_, x_); FPOP(c); }"
         if m == "fscale":
             return "ST(0) = fpu_scale(ST(0), ST(1));"
         if m in ("fprem", "fprem1"):
@@ -1523,9 +1522,12 @@ class Program:
         protected = set()
         for e in self.ghidra_entries & self.entries:
             protected |= self.analyze(e)[2]
+        data = self.switch_data()
         bad = {}
         for e in sorted(self.entries - self.ghidra_entries - protected):
-            why = self.analyze(e)[1]
+            inside = next((d for d in data if d[0] <= e < d[1]), None)
+            why = self.analyze(e)[1] or (inside and f"inside the {inside[3]} table {inside[0]:08x}-{inside[1]:08x} "
+                                                    f"read by the switch jump at {inside[2]:08x}")
             if why:
                 bad[e] = why
         changed = True
@@ -1543,6 +1545,70 @@ class Program:
             for t in self.analyze(e)[3]:  # switch tables recovered while decoding it
                 self.jumptables.pop(t, None)
         return len(bad)
+
+    def switch_data(self):
+        """(lo, hi, jump address, kind) of the bytes in .text that switch jumps read as data: each table jump's
+        `jmp [reg*4 + table]` dword table (the run of dwords at its displacement that are its known targets) and
+        the byte index table MSVC indexes first (`movzx reg, byte ptr [x + index]` just before the jump), whose
+        length the bounds check before it gives (`cmp x, n-1; ja default`)."""
+        import bisect
+        tlo, thi = self.text_range
+        rd = lambda va: int.from_bytes(self.img[va - self.base:va - self.base + 4], "little")
+        out = []
+        code = None   # instruction addresses of Ghidra's functions, and entries: only needed for unguarded tables
+        for at, targets in sorted(self.jumptables.items()):
+            ins = next(self.md.disasm(self.code(at, at + 16), at, count=1), None)
+            if ins is None or ins.mnemonic != "jmp" or ins.operands[0].type != CS_OP_MEM:
+                continue
+            m = ins.operands[0].mem
+            table = m.disp & 0xffffffff
+            if not (m.index and m.scale == 4 and tlo <= table < thi):
+                continue
+            ts, n = set(targets), 0
+            while table + 4 * n + 4 <= thi and rd(table + 4 * n) in ts:
+                n += 1
+            out.append((table, table + 4 * n, at, "jump"))
+            # the instructions just before the jump, in the function that contains it
+            owner = next((e for e in sorted(self.entries) if at in self.analyze(e)[0]), None)
+            if owner is None:
+                continue
+            addrs = sorted(self.analyze(owner)[0])
+            k = bisect.bisect_left(addrs, at)
+            prev = [next(self.md.disasm(self.code(a, a + 16), a, count=1)) for a in addrs[max(0, k - 64):k]]
+            idx_reg = ins.reg_name(m.index)
+            load = next((p for p in reversed(prev) if p.mnemonic == "movzx" and p.operands[0].type == CS_OP_REG
+                         and p.reg_name(p.operands[0].reg) == idx_reg and p.operands[1].type == CS_OP_MEM
+                         and p.operands[1].size == 1), None)
+            if load is None:
+                continue
+            lm = load.operands[1].mem
+            index = lm.disp & 0xffffffff
+            if not tlo <= index < thi:
+                continue
+            sel = load.reg_name(lm.base or lm.index)
+            # the bounds check: the unsigned jump to the default case before the load, and the instruction that
+            # last set the flags it tests (the compiler may schedule other work in between)
+            before = prev[:prev.index(load)]
+            bound = next((p for p in reversed(before) if p.mnemonic in ("ja", "jae")), None)
+            setter = bound and next((p for p in reversed(before[:before.index(bound)])
+                                     if X.X86_REG_EFLAGS in p.regs_access()[1]), None)
+            if setter is not None and setter.mnemonic == "cmp" and setter.operands[0].type == CS_OP_REG \
+                    and setter.reg_name(setter.operands[0].reg) == sel and setter.operands[1].type == CS_OP_IMM:
+                limit = setter.operands[1].imm & 0xffffffff
+                out.append((index, index + limit + (1 if bound.mnemonic == "ja" else 0), at, "index"))
+                continue
+            if bound is not None or setter is not None:
+                raise SystemExit(f"switch jump at {at:08x}: a bounds check this does not recognise for its index "
+                                 f"table at {index:08x}")
+            # No bounds check (the callers keep the selector in range): every byte of the table is an index into
+            # the n-entry jump table, so it runs while bytes are below n, up to the next instruction or entry
+            if code is None:
+                code = set().union(*(self.analyze(e)[0] for e in self.ghidra_entries & self.entries)) | self.entries
+            end = index
+            while end < thi and end not in code and self.img[end - self.base] < n:
+                end += 1
+            out.append((index, end, at, "index"))
+        return sorted(out)
 
     def add_unaligned_tables(self):
         """Pointer tables at addresses that are not 4-byte aligned (add_pointer_entries scans aligned words
@@ -1613,6 +1679,7 @@ class Program:
         md = Cs(CS_ARCH_X86, CS_MODE_32)
         md.detail = True
         insn_starts, imms, cross = set(), set(), set()
+        in_insn = bytearray(thi - tlo)  # bytes of Ghidra's functions' instructions
         ordered_g = sorted(self.entries)
         import bisect
         for f in list(self.functions.values()):
@@ -1622,6 +1689,7 @@ class Program:
             for a, b in f["ranges"]:
                 for ins in md.disasm(self.code(a, b), a):
                     insn_starts.add(ins.address)
+                    in_insn[ins.address - tlo:ins.address + ins.size - tlo] = b"\x01" * ins.size
                     if ins.mnemonic in ("push", "mov", "lea") and ins.operands and ins.operands[-1].type == CS_OP_IMM:
                         imms.add(ins.operands[-1].imm & 0xffffffff)
                     # direct jumps into the middle of another function (MSVC's strcpy jumps into strcat's
@@ -1689,8 +1757,8 @@ class Program:
         self.gap_entries = gaps
         for va in range(tlo, thi - 3, 4):
             v = rd(va)
-            if not (tlo <= v < thi):
-                continue
+            if not (tlo <= v < thi) or any(in_insn[va - tlo:va + 4 - tlo]):
+                continue   # not an address in .text, or bytes of an instruction (an immediate, a displacement)
             in_table = (tlo <= rd(va - 4) < thi) or (va + 8 <= thi and tlo <= rd(va + 4) < thi)
             if accept(v) or (in_table and unowned_code(v)):
                 cands.add(v)
