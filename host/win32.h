@@ -19,10 +19,11 @@
 #include <time.h>
 
 #define ARG(i) R32(c->esp + 4 + 4 * (i))
-/* return from a stdcall import with `nargs` 32-bit arguments */
-#define RET(nargs, value) do { c->eax = (uint32_t)(value); c->esp += 4 + 4 * (nargs); return; } while (0)
+/* return from a stdcall import with `nargs` 32-bit arguments; like `ret`, it records where it returns to
+   (CPU.ret_to), which a `push label; jmp [iat]` call site resumes at */
+#define RET(nargs, value) do { c->eax = (uint32_t)(value); c->ret_to = R32(c->esp); c->esp += 4 + 4 * (nargs); return; } while (0)
 /* cdecl (variadic) imports: caller cleans up the arguments */
-#define RET_CDECL(value) do { c->eax = (uint32_t)(value); c->esp += 4; return; } while (0)
+#define RET_CDECL(value) do { c->eax = (uint32_t)(value); c->ret_to = R32(c->esp); c->esp += 4; return; } while (0)
 
 #define GSTR(a) ((const char *)HP(a))
 #define GWSTR(a) ((const uint16_t *)HP(a))

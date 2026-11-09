@@ -1,6 +1,6 @@
-"""x87 state under Unicorn for difftest.py: where the emulator (Unicorn 2.1, whose x87 is QEMU 5.0's) departs from
-the hardware, the corrections applied while a function runs, and the double-precision register model behind the
-x87_ext outcome.
+"""x87 (and SSE) state under Unicorn for difftest.py: where the emulator (Unicorn 2.1, whose x87 and SSE are QEMU
+5.0's) departs from the hardware, the corrections applied while a function runs, and the double-precision register
+model behind the x87_ext outcome.
 
 Corrections (each restores what the Intel SDM specifies; the recompiled code implements the same):
   * FNSAVE/FSAVE/FNSTENV/FSTENV images. The recompiled code does not model the instruction and operand pointers
@@ -15,6 +15,22 @@ Corrections (each restores what the Intel SDM specifies; the recompiled code imp
   * FYL2X. QEMU 5.0 computes y * log2(x) in host doubles and, unless x > 0, leaves the stack and the result
     alone and sets C2 instead; it raises no flags. Wherever x is not a positive finite number or y is not finite,
     the instruction is performed here per SDM Vol. 2A, FYL2X, table "FYL2X Results".
+  * FSIN, FCOS, FSINCOS, FPTAN of an infinity or a NaN. QEMU treats an infinity as out of range (C2 set, the
+    operand left in place) where it is an invalid operand whose masked result is the real indefinite (C2 clear);
+    its FCOS of a NaN drops the NaN's sign (host cos()); and its FPTAN of a NaN pushes 1.0 above the NaN. The
+    SDM (Vol. 2A, the instructions' results tables: a NaN source gives NaN results) and Bochs' implementation:
+    every result is the source NaN quieted, or the real indefinite for an infinity; FSINCOS and FPTAN push the
+    second. Finite operands are left to the emulator.
+  * Signalling NaNs converted to or from single and double precision. FLD m32/m64 converts to the register
+    format and FST/FSTP m32/m64 from it; for a signalling NaN the conversion gives the quieted NaN, sign and the
+    payload bits the destination holds kept (SDM Vol. 1 §4.8.3.4, and §4.9.1.1: IE, masked). QEMU 5.0 converts
+    without quieting (floatx80ToCommonNaN/commonNaNToFloat*, which only arithmetic quiets), and on a store whose
+    remaining payload is zero gives its default NaN (negative, the real indefinite) instead. FLD m80 and
+    FSTP m80 copy the value unchanged on both. The quieted value is written after the emulator's instruction.
+  * SSE arithmetic with two NaN operands. The SSE rule is the first source operand (the destination), quieted
+    (SDM Vol. 1 Table 4-7, "SSE/SSE2/SSE3: first source operand"); QEMU 5.0 applies the x87 rule (a QNaN over
+    an SNaN, then the larger significand) to SSE as well. With one NaN operand both give that NaN, quieted. The
+    lanes where both operands are NaN are rewritten after the emulator's instruction.
 
 Not modelled by either side, so neither corrected nor compared as such: DE, OE, UE and PE; C1 (set when a result
 was rounded up); the stack fault (SF, and IE for stack underflow/overflow: both sides read an empty register's
@@ -24,10 +40,11 @@ code's double registers, and are left to the emulator.
 """
 from fractions import Fraction
 
-from capstone import CS_ARCH_X86, CS_MODE_32, Cs
+from capstone import CS_ARCH_X86, CS_MODE_32, CS_OP_REG, Cs
 from capstone.x86_const import X86_REG_FS
 from unicorn import UC_HOOK_CODE
 from unicorn import x86_const as ux
+from uchooks import bytes_or_zero
 
 FP_REGS = [getattr(ux, f"UC_X86_REG_FP{i}") for i in range(8)]
 IE, ZE = 0x0001, 0x0004
@@ -37,6 +54,11 @@ FRAC_MASK = (1 << 63) - 1
 INDEFINITE = (0xC000000000000000, 0xFFFF)   # (significand, sign|exponent)
 SAVE_MNEMONICS = ("fnsave", "fsave", "fnstenv", "fstenv")
 DIV_MNEMONICS = ("fdiv", "fdivp", "fdivr", "fdivrp", "fidiv", "fidivr")
+TRIG_MNEMONICS = ("fsin", "fcos", "fsincos", "fptan")
+STORE_MNEMONICS = ("fst", "fstp")
+# SSE arithmetic with a NaN-propagating result: lane width in bits and the number of lanes it writes
+SSE_ARITH = {f"{op}{form}": (32 if form[1] == "s" else 64, {"ps": 4, "pd": 2, "ss": 1, "sd": 1}[form])
+             for op in ("add", "sub", "mul", "div") for form in ("ps", "pd", "ss", "sd")}
 
 
 class Ext:
@@ -125,22 +147,36 @@ class Corrections:
             for a, b in f["ranges"]:
                 for ins in md.disasm(self.image[a - self.base:b - self.base], a):
                     m = ins.mnemonic
+                    ieee = "dword ptr" in ins.op_str or "qword ptr" in ins.op_str   # a 32- or 64-bit memory operand
                     kind = "save" if m in SAVE_MNEMONICS else "div" if m in DIV_MNEMONICS else \
-                        "fyl2x" if m == "fyl2x" else None
+                        "fyl2x" if m == "fyl2x" else "trig" if m in TRIG_MNEMONICS else \
+                        "load" if m == "fld" and ieee else "store" if m in STORE_MNEMONICS and ieee else \
+                        "sse" if m in SSE_ARITH else None
                     if kind:
                         self.sites[ins.address] = (ins.size, kind)
 
-    def install(self, uc):
+    def install(self, uc, guard):
+        """One code hook over the sites' span, dispatching by address. Not a hook per site: Unicorn walks its whole
+        list of code hooks at every hooked instruction, and with an instruction limit (emu_start's count, itself a
+        code hook over everything) every instruction is hooked, so ~10^5 site hooks cost ~10^5 checks each.
+        guard wraps the hook (tests/uchooks.py guarded)."""
+        if not self.sites:
+            return
         pending = []   # fixups the instruction just executed left for the start of the next one
-        for a, (size, kind) in self.sites.items():
-            uc.hook_add(UC_HOOK_CODE, getattr(self, f"before_{kind}"), (size, pending), begin=a, end=a)
-            if kind != "fyl2x":   # FYL2X is either left to the emulator or performed in full before it
-                uc.hook_add(UC_HOOK_CODE, self.apply_pending, pending, begin=a + size, end=a + size)
+        before = {a: (getattr(self, f"before_{kind}"), (size, pending)) for a, (size, kind) in self.sites.items()}
+        # where the instruction after a site starts: its fixups are applied there, before anything else runs
+        ends = {a + size for a, (size, kind) in self.sites.items() if kind not in ("fyl2x", "trig")}
+        # (fyl2x and trig are either left to the emulator or performed in full before it)
 
-    @staticmethod
-    def apply_pending(uc, addr, size, pending):
-        while pending:
-            pending.pop()(uc)
+        def dispatch(uc_, addr, size, data):
+            if pending and addr in ends:
+                while pending:
+                    pending.pop()(uc_)
+            site = before.get(addr)
+            if site is not None:
+                site[0](uc_, addr, size, site[1])
+
+        uc.hook_add(UC_HOOK_CODE, guard(dispatch), None, begin=min(before), end=max(ends | set(before)))
 
     def decode(self, uc, addr, size, mnemonics):
         """The instruction now at a site, if it is still one of these: the image is writable, and a function's
@@ -148,8 +184,9 @@ class Corrections:
         ins = next(self.md.disasm(bytes(uc.mem_read(addr, size)), addr, count=1), None)
         return ins if ins is not None and ins.size == size and ins.mnemonic in mnemonics else None
 
-    def ea(self, uc, ins):
-        m = ins.operands[0].mem
+    def ea(self, uc, ins, k=0):
+        """The address of memory operand k."""
+        m = ins.operands[k].mem
         reg = lambda r: uc.reg_read(getattr(ux, f"UC_X86_REG_{ins.reg_name(r).upper()}")) if r else 0
         seg = self.tib if m.segment == X86_REG_FS else 0   # fs: is the thread information block; the rest flat
         return (seg + reg(m.base) + reg(m.index) * m.scale + m.disp) & 0xFFFFFFFF
@@ -175,7 +212,7 @@ class Corrections:
         reverse = (modrm >> 3) & 7 == 7   # memory forms: /6 FDIV(I) ST(0) / m, /7 FDIVR/FIDIVR m / ST(0)
         if modrm >> 6 != 3:
             a = self.ea(uc, ins)
-            raw = bytes(uc.mem_read(a, {0xD8: 4, 0xDC: 8, 0xDA: 4, 0xDE: 2}[op]))
+            raw = bytes_or_zero(uc, a, {0xD8: 4, 0xDC: 8, 0xDA: 4, 0xDE: 2}[op])
             if op in (0xDA, 0xDE):
                 mem = Ext.of_fraction(Fraction(int.from_bytes(raw, "little", signed=True)))
             else:
@@ -249,6 +286,88 @@ class Corrections:
         uc.reg_write(ux.UC_X86_REG_FPTAG, uc.reg_read(ux.UC_X86_REG_FPTAG) | 3 << (2 * t))   # pop: ST(0) empty
         sw = uc.reg_read(ux.UC_X86_REG_FPSW)
         uc.reg_write(ux.UC_X86_REG_FPSW, (sw & ~0x3800) | flags | ((t + 1) & 7) << 11)
+        uc.reg_write(ux.UC_X86_REG_EIP, addr + size)
+
+
+    # ---- signalling NaNs through FLD m32/m64 and FST/FSTP m32/m64
+    def before_load(self, uc, addr, size, data):
+        _, pending = data
+        ins = self.decode(uc, addr, size, ("fld",))
+        if ins is None or ins.operands[0].size not in (4, 8):
+            return
+        if from_ieee(bytes_or_zero(uc, self.ea(uc, ins), ins.operands[0].size)).kind != "snan":
+            return
+
+        def fix(uc_):
+            r = st(uc_, 0)
+            uc_.reg_write(FP_REGS[top(uc_)], (r.mant | QUIET_BIT, r.se))
+        pending.append(fix)
+
+    def before_store(self, uc, addr, size, data):
+        _, pending = data
+        ins = self.decode(uc, addr, size, STORE_MNEMONICS)
+        if ins is None or ins.operands[0].size not in (4, 8):
+            return
+        x = st(uc, 0)
+        if x.kind != "snan":
+            return
+        n, ea = ins.operands[0].size, self.ea(uc, ins)
+        if n == 4:   # the significand's fraction (below the integer bit) truncated to the destination's
+            raw = x.sign << 31 | 0x7FC00000 | (x.mant >> 40) & 0x7FFFFF
+        else:
+            raw = x.sign << 63 | 0x7FF8000000000000 | (x.mant >> 11) & 0xFFFFFFFFFFFFF
+        pending.append(lambda uc_: uc_.mem_write(ea, raw.to_bytes(n, "little")))
+
+    # ---- SSE arithmetic: two NaN operands give the first, quieted
+    def before_sse(self, uc, addr, size, data):
+        _, pending = data
+        ins = self.decode(uc, addr, size, tuple(SSE_ARITH))
+        if ins is None:
+            return
+        bits, n = SSE_ARITH[ins.mnemonic]
+        dst = getattr(ux, f"UC_X86_REG_{ins.reg_name(ins.operands[0].reg).upper()}")
+        src = ins.operands[1]
+        if src.type == CS_OP_REG:
+            b = uc.reg_read(getattr(ux, f"UC_X86_REG_{ins.reg_name(src.reg).upper()}"))
+        else:
+            b = int.from_bytes(bytes_or_zero(uc, self.ea(uc, ins, 1), bits // 8 * n), "little")
+        a = uc.reg_read(dst)
+        mask, frac, quiet = (1 << bits) - 1, (23, 52)[bits == 64], 1 << (22, 51)[bits == 64]
+        exp = (mask >> 1) & ~((1 << frac) - 1)
+        nan = lambda v: v & exp == exp and v & ((1 << frac) - 1)
+        fix = {}
+        for k in range(n):
+            x, y = (a >> (bits * k)) & mask, (b >> (bits * k)) & mask
+            if nan(x) and nan(y):
+                fix[k] = x | quiet
+        if not fix:
+            return
+
+        def apply(uc_):
+            r = uc_.reg_read(dst)
+            for k, v in fix.items():
+                r = r & ~(mask << (bits * k)) | v << (bits * k)
+            uc_.reg_write(dst, r)
+        pending.append(apply)
+
+    # ---- FSIN/FCOS/FSINCOS/FPTAN of an infinity or a NaN
+    def before_trig(self, uc, addr, size, data):
+        ins = self.decode(uc, addr, size, TRIG_MNEMONICS)
+        if ins is None:
+            return
+        x = st(uc, 0)
+        if x.kind not in ("inf", "qnan", "snan"):
+            return
+        r = INDEFINITE if x.kind == "inf" else (x.mant | QUIET_BIT, x.se)
+        t = top(uc)
+        uc.reg_write(FP_REGS[t], r)
+        sw = uc.reg_read(ux.UC_X86_REG_FPSW) & ~0x0400   # C2 clear: the operand was not out of range
+        if ins.mnemonic in ("fsincos", "fptan"):
+            t = (t - 1) & 7
+            uc.reg_write(FP_REGS[t], r)
+            uc.reg_write(ux.UC_X86_REG_FPTAG, uc.reg_read(ux.UC_X86_REG_FPTAG) & ~(3 << (2 * t)))   # pushed: full
+            sw = (sw & ~0x3800) | t << 11
+        uc.reg_write(ux.UC_X86_REG_FPSW, sw)
         uc.reg_write(ux.UC_X86_REG_EIP, addr + size)
 
 

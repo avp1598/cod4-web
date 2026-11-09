@@ -10,11 +10,13 @@ import argparse
 import ctypes
 import os
 import random
+import re
 import sys
 from fractions import Fraction
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from difftest import GDT, GDT_PAGE, NAMES, PAGE, REGS, SCRATCH, SREGS, STACK_HI, STACK_LO, TIB, Tester  # noqa: E402
+from difftest import NAMES, PAGE, REGS, SCRATCH, STACK_HI, STACK_LO, Tester  # noqa: E402
+import winmodel  # noqa: E402
 from capstone import CS_ARCH_X86, CS_MODE_32, Cs  # noqa: E402
 from unicorn import x86_const  # noqa: E402
 
@@ -46,7 +48,17 @@ def exact(d):
 
 class TraceRec(ctypes.Structure):
     _fields_ = [("addr", ctypes.c_uint32), ("regs", ctypes.c_uint32 * 8), ("st0", ctypes.c_double),
-                ("top", ctypes.c_uint32)]
+                ("top", ctypes.c_uint32), ("xmm", (ctypes.c_uint32 * 4) * 8), ("mm", ctypes.c_uint64 * 8)]
+
+
+XMM_REGS = [getattr(x86_const, f"UC_X86_REG_XMM{i}") for i in range(8)]
+
+
+def uc_vregs(uc):
+    """xmm0-7 as four 32-bit lanes each, and mm0-7, as the trace records them. MMi is the significand of the
+    physical x87 register i (Unicorn 2.1 does not read its MM register ids; FPi are physical, see x87ref.st)."""
+    xmm = tuple(tuple((uc.reg_read(r) >> (32 * k)) & 0xFFFFFFFF for k in range(4)) for r in XMM_REGS)
+    return xmm, tuple(uc.reg_read(r)[0] for r in FP_REGS)
 
 
 def main():
@@ -66,6 +78,7 @@ def main():
     t = Tester(a.exe, a.lib, int(a.fpu_cw, 16))
     import json
     t.find_correction_sites([f for f in json.load(open(a.functions_json))["functions"] if f["ranges"]])
+    t.boot()   # trials start from the process after start-up, as in difftest.py
     md = Cs(CS_ARCH_X86, CS_MODE_32)
 
     def dis(addr):
@@ -81,10 +94,14 @@ def main():
     writer = {}  # guest address -> (step, eip) of the instruction that last wrote it under Unicorn
 
     ust0 = []
+    uvec = []
 
     def hook(uc, addr, size, data):
+        if winmodel.IMPORT_BASE <= addr < winmodel.IMPORT_BASE + t.import_size:
+            return   # an import, run by the model: the recompiled side replays it without tracing a step
         utrace.append((addr, [uc.reg_read(r) for r in REGS]))
         ust0.append(uc_st0(uc))
+        uvec.append(uc_vregs(uc))
 
     def on_write(uc, access, addr, size, value, data):
         for i in range(size):
@@ -93,24 +110,40 @@ def main():
     uc, err, demand = t.run_unicorn(entry, scratch, stack, regs, code_hook=hook, write_hook=on_write)
     if uc is None:
         print("unicorn did not finish:", err)
-    for k, r in enumerate(SREGS):
-        t.selectors[k] = uc.reg_read(r) if uc is not None else 0
-    t.cwrite(t.base, t.image)
-    t.cwrite(SCRATCH, scratch)
-    t.cwrite(STACK_LO, bytes(STACK_HI - STACK_LO))
-    t.cwrite(TIB, t.tib)
-    t.cwrite(GDT, GDT_PAGE)
-    t.cwrite(regs[4], stack)
-    for p in demand:
-        t.cwrite(p, bytes(PAGE))
+    t.prepare_recomp(uc, scratch, stack, regs, demand)
     cap = len(utrace) + 100000
     lib.dt_trace_start(cap)
-    cregs = (ctypes.c_uint32 * 8)(*regs)
+    cregs = (ctypes.c_uint32 * 9)(*regs, 0)   # [8]: EFLAGS out
     rc = lib.dt_run(entry, cregs, t.fpu_cw)
     n = lib.dt_trace_len()
     buf = lib.dt_trace_buf()
     ctrace = [(buf[i].addr, list(buf[i].regs)) for i in range(n)]
     cst0 = [exact(buf[i].st0) for i in range(n)]
+    cvec = [(tuple(tuple(buf[i].xmm[r][k] for k in range(4)) for r in range(8)), tuple(buf[i].mm[r] for r in range(8)))
+            for i in range(n)]
+    def mm_differs(j, r):
+        """MMr differs before step j as the recompiled code models it: changed by an MMX instruction naming MMr.
+        The runtime keeps MM apart from the x87 registers (they are not aliased), so x87 instructions change
+        Unicorn's MMr (a physical register's significand) and not the recompiled code's."""
+        return uvec[j][1][r] != cvec[j][1][r] and re.search(rf"\bmm{r}\b", dis(utrace[j - 1][0])) is not None
+
+    for j in range(1, min(len(uvec), len(cvec))):
+        if utrace[j][0] != ctrace[j][0]:
+            continue
+        xmm = [r for r in range(8) if uvec[j][0][r] != cvec[j][0][r]]
+        mm = [r for r in range(8) if mm_differs(j, r)]
+        if xmm or mm:
+            (ux_, um_), (cx_, cm_) = uvec[j], cvec[j]
+            for r in xmm:
+                print(f"xmm{r} first differs before step {j}: unicorn "
+                      + " ".join(f"{v:08x}" for v in ux_[r]) + " recomp " + " ".join(f"{v:08x}" for v in cx_[r])
+                      + " (lanes 0-3)")
+            for r in mm:
+                print(f"mm{r} first differs before step {j}: unicorn {um_[r]:016x} recomp {cm_[r]:016x}")
+            print(f"  produced by step {j - 1}: {utrace[j - 1][0]:08x} {dis(utrace[j - 1][0])}")
+            print(f"  state before it: " + "; ".join(
+                f"xmm{r} " + " ".join(f"{v:08x}" for v in uvec[j - 1][0][r]) for r in range(8)))
+            break
     for j in range(1, min(len(ust0), len(cst0))):
         if ust0[j] != cst0[j] and utrace[j][0] == ctrace[j][0]:
             u, r = ust0[j], cst0[j]

@@ -43,6 +43,23 @@ __thread uint32_t g_import_target;  /* which host slot the current import call c
 
 static uint32_t g_trace_call = 1;   /* RC_TRACE_CALL=addr: log indirect calls to that function */
 
+/* A call or jump to a host import slot: records which slot (g_import_target: COM dispatch and the difftest
+   replay read it), logs it with RC_LOG_IMPORTS, and traps on an import no handler implements. */
+static void enter_import(CPU *c, uint32_t target, GuestFn fn) {
+    const char *name = import_name(target);
+    if (g_log_imports < 0) g_log_imports = getenv("RC_LOG_IMPORTS") != NULL;
+    if (g_log_imports && name)
+        fprintf(stderr, "[import] %-40s from %08x  args %08x %08x %08x %08x\n", name, R32(c->esp),
+                R32(c->esp + 4), R32(c->esp + 8), R32(c->esp + 12), R32(c->esp + 16));
+    g_import_target = target;
+    if (fn == unimplemented_import) {
+        static char msg[160];
+        snprintf(msg, sizeof msg, "unimplemented Windows import %s (called from %08x)",
+                 name ? name : "?", R32(c->esp));
+        guest_trap(c, target, msg);
+    }
+}
+
 void call_indirect(CPU *c, uint32_t target) {
     if (g_trace_call == 1) g_trace_call = getenv("RC_TRACE_CALL") ? (uint32_t)strtoul(getenv("RC_TRACE_CALL"), NULL, 16) : 0;
     if (g_trace_call && target == g_trace_call) {
@@ -58,20 +75,7 @@ void call_indirect(CPU *c, uint32_t target) {
         snprintf(msg, sizeof msg, "indirect call to unknown function (return address %08x)", R32(c->esp));
         guest_trap(c, target, msg);
     }
-    if (target >= IMPORT_BASE) {
-        const char *name = import_name(target);
-        if (g_log_imports < 0) g_log_imports = getenv("RC_LOG_IMPORTS") != NULL;
-        if (g_log_imports && name)
-            fprintf(stderr, "[import] %-40s from %08x  args %08x %08x %08x %08x\n", name, R32(c->esp),
-                    R32(c->esp + 4), R32(c->esp + 8), R32(c->esp + 12), R32(c->esp + 16));
-        g_import_target = target;
-        if (fn == unimplemented_import) {
-            static char msg[160];
-            snprintf(msg, sizeof msg, "unimplemented Windows import %s (called from %08x)",
-                     name ? name : "?", R32(c->esp));
-            guest_trap(c, target, msg);
-        }
-    }
+    if (target >= IMPORT_BASE) enter_import(c, target, fn);
     fn(c);
 }
 
@@ -83,6 +87,7 @@ void jump_indirect(CPU *c, uint32_t target, uint32_t from) {
        frame does, guest_enter traps. */
     GuestFn fn = lookup_function(target);
     if (fn) {
+        if (target >= IMPORT_BASE) enter_import(c, target, fn);   /* `jmp [iat]` import thunks */
         fn(c);
         return;
     }
@@ -142,6 +147,8 @@ void trace_insn(CPU *c, uint32_t addr) {
     r->regs[4] = c->esp; r->regs[5] = c->ebp; r->regs[6] = c->esi; r->regs[7] = c->edi;
     r->st0 = c->st[c->top];
     r->top = (uint32_t)c->top;
+    memcpy(r->xmm, c->xmm, sizeof r->xmm);
+    memcpy(r->mm, c->mm, sizeof r->mm);
 }
 
 /* ------------------------------------------------------------------ x87 helpers */

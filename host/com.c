@@ -28,6 +28,7 @@ static void com_dispatch(CPU *c) {
         fprintf(stderr, "[com] %s::%s not implemented: returning S_OK\n", it->name, m->name);
     }
     c->eax = S_OK;
+    c->ret_to = R32(c->esp);
     c->esp += 4 + 4 * (uint32_t)(m->nargs + 1);
 }
 

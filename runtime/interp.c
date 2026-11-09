@@ -126,6 +126,8 @@ static uint8_t alu8(CPU *c, int op, uint8_t a, uint8_t b) {
 static uint32_t imul_flags(CPU *c, int32_t a, int32_t b) {
     int64_t r = (int64_t)a * b;
     c->cf = c->of = r != (int32_t)r;
+    /* undefined in the SDM; as the translator (and QEMU): from the low 32 bits, AF clear */
+    c->zf = (uint32_t)r == 0; c->sf = (int32_t)r < 0; c->pf_byte = (uint8_t)r; c->af = 0;
     return (uint32_t)r;
 }
 static uint32_t shift32(CPU *c, int op, uint32_t a, unsigned n, uint32_t eip) {

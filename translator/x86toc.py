@@ -23,6 +23,7 @@ GP32 = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"]
 GP16 = {"ax": "eax", "cx": "ecx", "dx": "edx", "bx": "ebx", "sp": "esp", "bp": "ebp", "si": "esi", "di": "edi"}
 GP8L = {"al": "eax", "cl": "ecx", "dl": "edx", "bl": "ebx"}
 GP8H = {"ah": "eax", "ch": "ecx", "dh": "edx", "bh": "ebx"}
+SETJMP_NAME = re.compile(r"_{0,2}setjmp3?|_{0,2}setjmpex")   # setjmp, _setjmp, _setjmp3, __setjmp3, _setjmpex
 UT = {1: "uint8_t", 2: "uint16_t", 4: "uint32_t", 8: "uint64_t"}
 ST_ = {1: "int8_t", 2: "int16_t", 4: "int32_t", 8: "int64_t"}
 BITS = {1: 8, 2: 16, 4: 32}
@@ -87,9 +88,9 @@ class Unsupported(Exception):
 # them: before a call (then everything is reloaded, since the callee may change any of it), before a
 # return, and before a trap. A forward dataflow over the function finds which values may have changed
 # since the last write-back, so only those are stored.
-CACHED = GP32 + ["cf", "zf", "sf", "of", "pf_byte"]
+CACHED = GP32 + ["cf", "zf", "sf", "of", "pf_byte", "af"]
 CBIT = {n: 1 << i for i, n in enumerate(CACHED)}
-FLAG_BITS = CBIT["cf"] | CBIT["zf"] | CBIT["sf"] | CBIT["of"] | CBIT["pf_byte"]
+FLAG_BITS = CBIT["cf"] | CBIT["zf"] | CBIT["sf"] | CBIT["of"] | CBIT["pf_byte"] | CBIT["af"]
 X87_BIT = 1 << len(CACHED)
 XMM_BIT = [1 << (len(CACHED) + 1 + k) for k in range(8)]
 MM_BIT = [1 << (len(CACHED) + 9 + k) for k in range(8)]
@@ -446,9 +447,13 @@ class FunctionTranslator:
         insns = self.decode()
         self.insns = insns
         self.insn_addrs = {i.address for i in insns}
-        # code of this function it pushes as a return address itself: where a call can come back to (unwind_stmt)
+        # code of this function it pushes as a return address itself: where a call can come back to (unwind_stmt);
+        # and the return address of each of its setjmp calls, where a longjmp comes back to
         self.resume_points = {i.operands[0].imm & 0xffffffff for i in insns if i.mnemonic == "push" and i.operands
                               and i.operands[0].type == CS_OP_IMM and (i.operands[0].imm & 0xffffffff) in self.insn_addrs}
+        self.resume_points |= {i.address + i.size for i in insns if i.mnemonic == "call" and i.operands
+                               and i.operands[0].type == CS_OP_IMM and i.operands[0].imm in self.p.setjmp_entries
+                               and i.address + i.size in self.insn_addrs}
         body = []
         unsupported = []
         if insns and insns[0].address != self.entry:
@@ -589,23 +594,24 @@ class FunctionTranslator:
         return ("c->edi = POP32(c); c->esi = POP32(c); c->ebp = POP32(c); c->esp += 4; "
                 "c->ebx = POP32(c); c->edx = POP32(c); c->ecx = POP32(c); c->eax = POP32(c);")
 
-    FLAGS_PACK = ("((uint32_t)c->cf | (PF(c) << 2) | ((uint32_t)c->zf << 6) | ((uint32_t)c->sf << 7) | "
-                  "((uint32_t)c->df << 10) | ((uint32_t)c->of << 11) | ((uint32_t)c->idf << 21) | 0x202u)")
+    FLAGS_PACK = ("((uint32_t)c->cf | (PF(c) << 2) | ((uint32_t)c->af << 4) | ((uint32_t)c->zf << 6) | "
+                  "((uint32_t)c->sf << 7) | ((uint32_t)c->df << 10) | ((uint32_t)c->of << 11) | "
+                  "((uint32_t)c->idf << 21) | 0x202u)")
 
     def i_pushfd(self, ins, o):
         return f"PUSH32(c, {self.FLAGS_PACK});"
 
     def i_popfd(self, ins, o):
         return ("{ uint32_t f_ = POP32(c); c->cf = f_ & 1; c->pf_byte = (f_ >> 2) & 1 ? 0 : 1; "
-                "c->zf = (f_ >> 6) & 1; c->sf = (f_ >> 7) & 1; c->df = (f_ >> 10) & 1; c->of = (f_ >> 11) & 1; "
+                "c->af = (f_ >> 4) & 1; c->zf = (f_ >> 6) & 1; c->sf = (f_ >> 7) & 1; c->df = (f_ >> 10) & 1; c->of = (f_ >> 11) & 1; "
                 "c->idf = (f_ >> 21) & 1; }")
 
     def i_lahf(self, ins, o):
-        return self.reg_write("ah", "(c->cf | (PF(c) << 2) | 2 | (c->zf << 6) | (c->sf << 7))")
+        return self.reg_write("ah", "(c->cf | (PF(c) << 2) | 2 | (c->af << 4) | (c->zf << 6) | (c->sf << 7))")
 
     def i_sahf(self, ins, o):
         return ("{ uint32_t f_ = (c->eax >> 8) & 0xff; c->cf = f_ & 1; c->pf_byte = (f_ >> 2) & 1 ? 0 : 1; "
-                "c->zf = (f_ >> 6) & 1; c->sf = (f_ >> 7) & 1; }")
+                "c->af = (f_ >> 4) & 1; c->zf = (f_ >> 6) & 1; c->sf = (f_ >> 7) & 1; }")
 
     def i_cdq(self, ins, o):
         return "c->edx = (uint32_t)((int32_t)c->eax >> 31);"
@@ -690,43 +696,57 @@ class FunctionTranslator:
         src = self.read(ins, o[1])
         return self.rmw(ins, o[0], lambda a: (
             f"({{ unsigned n_ = {n} & 31; uint32_t r_ = n_ ? (({a} << n_) | ({src} >> (32 - n_))) : {a}; "
-            f"if (n_) {{ c->cf = ({a} >> (32 - n_)) & 1; c->zf = r_ == 0; c->sf = (int32_t)r_ < 0; c->pf_byte = (uint8_t)r_; }} r_; }})"))
+            f"if (n_) {{ uint32_t s_ = (uint32_t)(((((uint64_t){a} << 32) | {src}) << (n_ - 1)) >> 32); "
+            f"c->cf = ({a} >> (32 - n_)) & 1; c->zf = r_ == 0; c->sf = (int32_t)r_ < 0; c->pf_byte = (uint8_t)r_; "
+            f"c->of = (s_ ^ r_) >> 31; c->af = 0; }} r_; }})"))
 
     def i_shrd(self, ins, o):
         n = str(o[2].imm) if o[2].type == CS_OP_IMM else "(c->ecx & 0xff)"
         src = self.read(ins, o[1])
         return self.rmw(ins, o[0], lambda a: (
             f"({{ unsigned n_ = {n} & 31; uint32_t r_ = n_ ? (({a} >> n_) | ({src} << (32 - n_))) : {a}; "
-            f"if (n_) {{ c->cf = ({a} >> (n_ - 1)) & 1; c->zf = r_ == 0; c->sf = (int32_t)r_ < 0; c->pf_byte = (uint8_t)r_; }} r_; }})"))
+            f"if (n_) {{ uint32_t s_ = (uint32_t)((((uint64_t){src} << 32) | {a}) >> (n_ - 1)); "
+            f"c->cf = ({a} >> (n_ - 1)) & 1; c->zf = r_ == 0; c->sf = (int32_t)r_ < 0; c->pf_byte = (uint8_t)r_; "
+            f"c->of = (s_ ^ r_) >> 31; c->af = 0; }} r_; }})"))
+
+    @staticmethod
+    def mul_flags(r, size):
+        """ZF, SF and PF of a MUL/IMUL, which the SDM leaves undefined: QEMU's, from the low `size` bytes of the
+        product (what the destination holds; AL, AX or EAX for one operand); AF clear. CF and OF are the caller's."""
+        return (f" c->zf = ({UT[size]}){r} == 0; c->sf = ({ST_[size]}){r} < 0; c->pf_byte = (uint8_t){r};"
+                " c->af = 0;")
 
     def i_imul(self, ins, o):
         if len(o) == 1:
             s = o[0].size
             if s == 4:
                 return ("{ int64_t r_ = (int64_t)(int32_t)c->eax * (int32_t)" + self.read(ins, o[0]) +
-                        "; c->eax = (uint32_t)r_; c->edx = (uint32_t)(r_ >> 32); c->cf = c->of = r_ != (int32_t)r_; }")
+                        "; c->eax = (uint32_t)r_; c->edx = (uint32_t)(r_ >> 32); c->cf = c->of = r_ != (int32_t)r_;"
+                        + self.mul_flags("r_", 4) + " }")
             if s == 2:
                 return ("{ int32_t r_ = (int16_t)c->eax * (int16_t)" + self.read(ins, o[0]) +
                         "; " + self.reg_write("ax", "r_") + " " + self.reg_write("dx", "r_ >> 16") +
-                        " c->cf = c->of = r_ != (int16_t)r_; }")
+                        " c->cf = c->of = r_ != (int16_t)r_;" + self.mul_flags("r_", 2) + " }")
             return ("{ int16_t r_ = (int8_t)c->eax * (int8_t)" + self.read(ins, o[0]) + "; " +
-                    self.reg_write("ax", "r_") + " c->cf = c->of = r_ != (int8_t)r_; }")
+                    self.reg_write("ax", "r_") + " c->cf = c->of = r_ != (int8_t)r_;" + self.mul_flags("r_", 1) + " }")
         s = o[0].size
         a = self.read(ins, o[0]) if len(o) == 2 else self.read(ins, o[1])
         b = self.read(ins, o[1]) if len(o) == 2 else self.read(ins, o[2], s)
         return ("{ int64_t r_ = (int64_t)(" + ST_[s] + ")" + a + " * (" + ST_[s] + ")" + b + "; " +
-                self.write(ins, o[0], "r_") + f" c->cf = c->of = r_ != ({ST_[s]})r_; }}")
+                self.write(ins, o[0], "r_") + f" c->cf = c->of = r_ != ({ST_[s]})r_;" + self.mul_flags("r_", s) + " }")
 
     def i_mul(self, ins, o):
         s = o[0].size
         if s == 4:
             return ("{ uint64_t r_ = (uint64_t)c->eax * " + self.read(ins, o[0]) +
-                    "; c->eax = (uint32_t)r_; c->edx = (uint32_t)(r_ >> 32); c->cf = c->of = c->edx != 0; }")
+                    "; c->eax = (uint32_t)r_; c->edx = (uint32_t)(r_ >> 32); c->cf = c->of = c->edx != 0;"
+                    + self.mul_flags("r_", 4) + " }")
         if s == 2:
             return ("{ uint32_t r_ = (uint32_t)(uint16_t)c->eax * " + self.read(ins, o[0]) + "; " +
-                    self.reg_write("ax", "r_") + " " + self.reg_write("dx", "r_ >> 16") + " c->cf = c->of = (r_ >> 16) != 0; }")
+                    self.reg_write("ax", "r_") + " " + self.reg_write("dx", "r_ >> 16") + " c->cf = c->of = (r_ >> 16) != 0;"
+                    + self.mul_flags("r_", 2) + " }")
         return ("{ uint16_t r_ = (uint16_t)((uint8_t)c->eax * " + self.read(ins, o[0]) + "); " +
-                self.reg_write("ax", "r_") + " c->cf = c->of = (r_ >> 8) != 0; }")
+                self.reg_write("ax", "r_") + " c->cf = c->of = (r_ >> 8) != 0;" + self.mul_flags("r_", 1) + " }")
 
     def i_div(self, ins, o):
         s = o[0].size
@@ -785,13 +805,22 @@ class FunctionTranslator:
     def i_btr(self, ins, o): return self.bitop(ins, o, "btr")
     def i_btc(self, ins, o): return self.bitop(ins, o, "btc")
 
+    # BSF/BSR define only ZF (source zero); the other flags are QEMU's: CF, OF, AF clear, SF and PF of the source
+    def bit_scan_flags(self, size):
+        return (f"c->zf = v_ == 0; c->sf = ({ST_[size]})v_ < 0; c->pf_byte = (uint8_t)v_; c->cf = 0; c->of = 0; "
+                "c->af = 0;")
+
     def i_bsf(self, ins, o):
+        s = o[0].size
         v = self.read(ins, o[1])
-        return f"{{ uint32_t v_ = {v}; c->zf = v_ == 0; if (v_) {{ {self.write(ins, o[0], '__builtin_ctz(v_)')} }} }}"
+        return (f"{{ {UT[s]} v_ = {v}; {self.bit_scan_flags(s)} "
+                f"if (v_) {{ {self.write(ins, o[0], '__builtin_ctz(v_)')} }} }}")
 
     def i_bsr(self, ins, o):
+        s = o[0].size
         v = self.read(ins, o[1])
-        return f"{{ uint32_t v_ = {v}; c->zf = v_ == 0; if (v_) {{ {self.write(ins, o[0], '31 - __builtin_clz(v_)')} }} }}"
+        return (f"{{ {UT[s]} v_ = {v}; {self.bit_scan_flags(s)} "
+                f"if (v_) {{ {self.write(ins, o[0], f'{8 * s - 1} - (__builtin_clz(v_) - {32 - 8 * s})')} }} }}")
 
     def i_xadd(self, ins, o):
         s = o[0].size
@@ -959,7 +988,7 @@ class FunctionTranslator:
             pop = " FPOP(c);" if m == "fstp" else ""
             if o[0].type == CS_OP_MEM:
                 a = self.addr(ins, o[0])
-                w = {4: f"WF32({a}, (float)ST(0));", 8: f"WF64({a}, ST(0));", 10: f"WF80({a}, ST(0));"}[o[0].size]
+                w = {4: f"W32({a}, fst_f32(ST(0)));", 8: f"W64({a}, fst_f64(ST(0)));", 10: f"WF80({a}, ST(0));"}[o[0].size]
                 return w + pop
             return f"ST({self.st_idx(ins, o[0])}) = ST(0);" + pop
         if m in ("fist", "fistp", "fisttp"):
@@ -991,11 +1020,18 @@ class FunctionTranslator:
         if m in nan1:
             return (f"{{ double v_ = ST(0), r_ = {fn1[m]}; if (r_ != r_) r_ = x87_nan1(v_); "
                     f"ST(0) = {nan1[m].format(r='r_')}; }}")
+        # FSINCOS/FPTAN: a NaN gives that NaN (quieted) as both results and an infinity, an invalid operand, the
+        # real indefinite as both (SDM Vol. 2A results tables; x87_nan1 gives either), C2 clear; |x| >= 2^63 is out
+        # of range: C2 set, the operand left. The host's sin/cos/tan do not keep a NaN's sign.
         if m == "fsincos":
-            return ("{ double v_ = ST(0); if (fabs(v_) >= 9223372036854775808.0) c->fpu_sw |= 0x0400; "
+            return ("{ double v_ = ST(0); if (v_ != v_ || isinf(v_)) { double n_ = x87_nan1(v_); "
+                    "c->fpu_sw &= ~0x0400; ST(0) = n_; FPUSH(c, n_); } "
+                    "else if (fabs(v_) >= 9223372036854775808.0) c->fpu_sw |= 0x0400; "
                     "else { c->fpu_sw &= ~0x0400; ST(0) = sin(v_); FPUSH(c, cos(v_)); } }")
         if m == "fptan":
-            return ("{ double v_ = ST(0); if (fabs(v_) >= 9223372036854775808.0) c->fpu_sw |= 0x0400; "
+            return ("{ double v_ = ST(0); if (v_ != v_ || isinf(v_)) { double n_ = x87_nan1(v_); "
+                    "c->fpu_sw &= ~0x0400; ST(0) = n_; FPUSH(c, n_); } "
+                    "else if (fabs(v_) >= 9223372036854775808.0) c->fpu_sw |= 0x0400; "
                     "else { c->fpu_sw &= ~0x0400; ST(0) = tan(v_); FPUSH(c, 1.0); } }")
         if m == "fpatan":
             return ("{ double a_ = ST(1), b_ = ST(0), r_ = atan2(a_, b_); if (r_ != r_) r_ = x87_nan2(a_, b_); "
@@ -1439,6 +1475,10 @@ class Program:
         self.entries = set(self.functions)
         self.ghidra_entries = set(self.entries)  # real function starts; only these bound decoding
         self.jumptables = {j["at"]: j["targets"] for j in d["jumptables"]}
+        # setjmp: a call to it returns a second time when longjmp restores its jmp_buf, by jumping to the call's
+        # return address with the caller's frame (CPU.ret_to unwinds to it). Ghidra's function ID names the
+        # MSVC CRT's (_setjmp3); every function calling one resumes at that call's return address.
+        self.setjmp_entries = {e for e, f in self.functions.items() if SETJMP_NAME.fullmatch(f["name"])}
         self.md = Cs(CS_ARCH_X86, CS_MODE_32)
         self.md.detail = True
         self.trace = False
@@ -1460,8 +1500,9 @@ class Program:
     def analyze(self, e):
         """Decodes entry e by its control flow (FunctionTranslator.decode) once and caches: the instruction
         addresses, why it cannot be code (None if it can), the .text addresses it calls or jumps to outside its
-        own instructions, the switch tables recovered while decoding it, and the immediates its instructions
-        carry (addresses it takes as values, e.g. `mov edx, offset table`). Decoding depends only on Ghidra's
+        own instructions, the switch tables recovered while decoding it, the immediates its instructions
+        carry (addresses it takes as values, e.g. `mov edx, offset table`), and the (start, end) byte extents of
+        its instructions, sorted. Decoding depends only on Ghidra's
         entries and the jump tables, so adding or dropping other entries never invalidates it."""
         if e not in self._analysis:
             tlo, thi = self.text_range
@@ -1485,7 +1526,8 @@ class Program:
                                                                                      "loopne")
                 if tlo <= t < thi and (m == "call" or (branch and t not in addrs)):
                     targets.add(t)
-            self._analysis[e] = (addrs, why, targets, set(self.jumptables) - tables, consts)
+            extents = sorted((i.address, i.address + i.size) for i in insns)
+            self._analysis[e] = (addrs, why, targets, set(self.jumptables) - tables, consts, extents)
         return self._analysis[e]
 
     def settle(self):
@@ -1516,18 +1558,58 @@ class Program:
 
     def reject_non_code(self):
         """Drops entries that are not Ghidra's whose code reaches bytes that are no instruction, or an
-        instruction compiled user-mode code never contains (not_user_code), or that call or jump to such an
-        entry: compiled code never branches into data, so all of them are data that looked like code. An entry
-        a Ghidra function calls or jumps to is real code and is kept. Returns the number dropped."""
+        instruction compiled user-mode code never contains (not_user_code), or bytes a switch jump reads as its
+        table (switch_data), or an instruction that overlaps one of trusted code without sharing its bounds
+        (trusted_overlap), or that call or jump to such an entry: compiled code never branches into data nor has
+        overlapping instructions, so all of them are data that looked like code. An entry a Ghidra function
+        calls or jumps to is real code and is kept; that and Ghidra's functions are the trusted code. Returns
+        the number dropped."""
+        import bisect
         protected = set()
         for e in self.ghidra_entries & self.entries:
             protected |= self.analyze(e)[2]
+        trusted = sorted({x for e in (self.ghidra_entries | protected) & self.entries for x in self.analyze(e)[5]})
+        trusted_lo = [a for a, _ in trusted]
+
+        def trusted_overlap(extents):
+            """The first (instruction, trusted instruction) pair whose bytes overlap without being the same
+            instruction: decoding started inside an instruction of trusted code, or ran across its bounds."""
+            for a, b in extents:
+                k = max(bisect.bisect_right(trusted_lo, a) - 1, 0)
+                while k < len(trusted) and trusted[k][0] < b:
+                    if a < trusted[k][1] and trusted[k] != (a, b):
+                        return (a, b), trusted[k]
+                    k += 1
+            return None
         data = self.switch_data()
         bad = {}
+        # the tables' bytes as disjoint intervals, each naming the first table that covers it
+        merged = []
+        for d in data:
+            if d[0] >= d[1]:
+                continue
+            if merged and d[0] <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], d[1])
+            else:
+                merged.append([d[0], d[1], d])
+        merged_lo = [m[0] for m in merged]
+
+        def table_hit(extents):
+            """The first switch table (from data) any of these instruction extents overlaps, and where."""
+            for a, b in extents:
+                k = bisect.bisect_left(merged_lo, b) - 1   # the last interval starting before the instruction ends
+                if k >= 0 and merged[k][1] > a:
+                    return merged[k][2], a
+            return None
+
         for e in sorted(self.entries - self.ghidra_entries - protected):
-            inside = next((d for d in data if d[0] <= e < d[1]), None)
-            why = self.analyze(e)[1] or (inside and f"inside the {inside[3]} table {inside[0]:08x}-{inside[1]:08x} "
-                                                    f"read by the switch jump at {inside[2]:08x}")
+            hit = table_hit(self.analyze(e)[5])
+            lap = None if hit else trusted_overlap(self.analyze(e)[5])
+            why = self.analyze(e)[1] or (hit and f"decodes the instruction at {hit[1]:08x} from the {hit[0][3]} table "
+                                                 f"{hit[0][0]:08x}-{hit[0][1]:08x} read by the switch jump at "
+                                                 f"{hit[0][2]:08x}") or \
+                (lap and f"decodes an instruction at {lap[0][0]:08x}-{lap[0][1]:08x} overlapping the one at "
+                         f"{lap[1][0]:08x}-{lap[1][1]:08x} of Ghidra's code or code it reaches")
             if why:
                 bad[e] = why
         changed = True

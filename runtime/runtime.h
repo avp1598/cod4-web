@@ -42,7 +42,7 @@ GuestFn lookup_function(uint32_t addr);
 const char *import_name(uint32_t addr);
 uint32_t add_dynamic_import(const char *name, GuestFn fn);   /* for GetProcAddress */
 GuestFn find_import_handler(const char *name);
-extern __thread uint32_t g_import_target;  /* address of the host slot being called (set by call_indirect) */
+extern __thread uint32_t g_import_target;  /* address of the host slot being called (set by call_indirect and jump_indirect) */
 uint32_t guest_alloc(uint32_t size);
 void guest_call(CPU *c, GuestFn fn, int nargs, const uint32_t *args);
 /* Runs guest code from the host: the caller has pushed the arguments and GUEST_RETURN_SENTINEL. Returns once
@@ -55,7 +55,7 @@ void dyncode_register(uint32_t addr, uint32_t len);
 int dyncode_contains(uint32_t addr);
 void interp_call(CPU *c, uint32_t eip);   /* return address already pushed */
 
-typedef struct { uint32_t addr; uint32_t regs[8]; double st0; uint32_t top; } TraceRec;
+typedef struct { uint32_t addr; uint32_t regs[8]; double st0; uint32_t top; uint32_t xmm[8][4]; uint64_t mm[8]; } TraceRec;
 extern TraceRec *g_trace;          /* set by a test harness to record every instruction */
 extern uint32_t g_trace_len, g_trace_cap;
 

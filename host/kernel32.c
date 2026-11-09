@@ -69,10 +69,12 @@ W(GetProcAddress) {
 }
 
 W(GetModuleFileNameA) {
+    /* Windows XP (what GetVersionExA reports): at most n characters, terminated only if there is room */
     const char *p = GUEST_ROOT "\\" PROFILE_GUEST_EXE;
-    uint32_t buf = ARG(1), n = ARG(2);
-    snprintf((char *)HP(buf), n, "%s", p);
-    RET(3, strlen(p) < n ? strlen(p) : n);
+    uint32_t buf = ARG(1), n = ARG(2), len = (uint32_t)strlen(p), k = len < n ? len : n;
+    memcpy(HP(buf), p, k);
+    if (k < n) *HP(buf + k) = 0;
+    RET(3, k);
 }
 
 static uint32_t g_cmdline, g_env;

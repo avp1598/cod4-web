@@ -22,10 +22,13 @@ typedef union {
 
 typedef struct CPU {
     uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi;
-    /* Flags are kept as separate bytes; PF is derived from the low byte of the last result. */
+    /* Flags are kept as separate bytes; PF is derived from the low byte of the last result. Where the SDM leaves
+       a flag undefined after an instruction, it is set as the reference emulator (QEMU 5.0, under difftest) sets
+       it, so that code that reads all of EFLAGS (pushfd) sees the same value: see DEF_FLAGS. */
     uint8_t cf, zf, sf, of, df;
     uint8_t idf;      /* EFLAGS.ID (bit 21): toggled by code probing for CPUID */
     uint8_t pf_byte;
+    uint8_t af;       /* auxiliary carry (bit 4): carry or borrow out of bit 3 */
     /* x87: values held as host doubles (exact 80-bit behaviour is a later milestone). */
     double st[8];
     int top;          /* index of ST(0) within st[] */
@@ -39,7 +42,8 @@ typedef struct CPU {
     /* Where the last `ret` actually went. Each recompiled call site sets it to its own return address before
        the call and compares after: guest code can return past its caller (a CRT routine that discards return
        addresses, longjmp), and then each frame whose call does not return there returns too, until the one
-       whose does. Host functions never touch it, so calls into them always match. */
+       whose does. Host functions return like `ret` too (host/win32.h RET), so a call into one matches unless
+       guest code pushed a different return address before jumping to it. */
     uint32_t ret_to;
     uint32_t preempt_ticks;   /* deterministic scheduling: function entries since this thread last yielded */
 } CPU;
@@ -50,7 +54,7 @@ typedef struct CPU {
    values in machine registers instead of reloading them after every guest store. */
 typedef struct Regs {
     uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi;
-    uint8_t cf, zf, sf, of, pf_byte;
+    uint8_t cf, zf, sf, of, pf_byte, af;
 } Regs;
 #define RC_INLINE static inline __attribute__((always_inline))
 
@@ -96,53 +100,58 @@ RC_INLINE uint32_t POP32r(Regs *c) { uint32_t v = R32(c->esp); c->esp += 4; retu
 static inline int PF(const CPU *c) { return !__builtin_parity(c->pf_byte); }
 RC_INLINE int PFr(const Regs *c) { return !__builtin_parity(c->pf_byte); }
 
+/* AF is the carry or borrow out of bit 3 after add, adc, sub, sbb, cmp, inc, dec, neg (and so xadd, cmpxchg). The
+   SDM leaves it undefined after logic operations, shifts by a nonzero count and multiplications; QEMU clears it
+   there, and so does this (rotates leave it). Likewise OF after SHR by more than 1 (QEMU: 0, from the operand
+   shifted by n - 1 against the result) and the flags after MUL/IMUL/SHLD/SHRD/BSF/BSR (see the translator). */
 #define DEF_FLAGS(BITS, T, ST, S, X)                                                               \
     static inline T add##BITS##X(S *c, T a, T b) {                                                 \
         T r = (T)(a + b);                                                                          \
         c->cf = r < a; c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r;                 \
-        c->of = (((a ^ r) & (b ^ r)) >> (BITS - 1)) & 1;                                           \
+        c->of = (((a ^ r) & (b ^ r)) >> (BITS - 1)) & 1; c->af = ((a ^ b ^ r) >> 4) & 1;          \
         return r;                                                                                  \
     }                                                                                              \
     static inline T adc##BITS##X(S *c, T a, T b) {                                                 \
         unsigned cin = c->cf;                                                                      \
         T r = (T)(a + b + cin);                                                                    \
         c->cf = cin ? r <= a : r < a; c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r;  \
-        c->of = (((a ^ r) & (b ^ r)) >> (BITS - 1)) & 1;                                           \
+        c->of = (((a ^ r) & (b ^ r)) >> (BITS - 1)) & 1; c->af = ((a ^ b ^ r) >> 4) & 1;          \
         return r;                                                                                  \
     }                                                                                              \
     static inline T sub##BITS##X(S *c, T a, T b) {                                                 \
         T r = (T)(a - b);                                                                          \
         c->cf = a < b; c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r;                 \
-        c->of = (((a ^ b) & (a ^ r)) >> (BITS - 1)) & 1;                                           \
+        c->of = (((a ^ b) & (a ^ r)) >> (BITS - 1)) & 1; c->af = ((a ^ b ^ r) >> 4) & 1;          \
         return r;                                                                                  \
     }                                                                                              \
     static inline T sbb##BITS##X(S *c, T a, T b) {                                                 \
         unsigned cin = c->cf;                                                                      \
         T r = (T)(a - b - cin);                                                                    \
         c->cf = cin ? a <= b : a < b; c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r;  \
-        c->of = (((a ^ b) & (a ^ r)) >> (BITS - 1)) & 1;                                           \
+        c->of = (((a ^ b) & (a ^ r)) >> (BITS - 1)) & 1; c->af = ((a ^ b ^ r) >> 4) & 1;          \
         return r;                                                                                  \
     }                                                                                              \
     static inline T logic##BITS##X(S *c, T r) {                                                    \
         c->cf = 0; c->of = 0; c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r;          \
+        c->af = 0;                                                                                 \
         return r;                                                                                  \
     }                                                                                              \
     static inline T inc##BITS##X(S *c, T a) { /* CF preserved */                                   \
         T r = (T)(a + 1);                                                                          \
         c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r;                                \
-        c->of = r == (T)((T)1 << (BITS - 1));                                                      \
+        c->of = r == (T)((T)1 << (BITS - 1)); c->af = ((a ^ r) >> 4) & 1;                          \
         return r;                                                                                  \
     }                                                                                              \
     static inline T dec##BITS##X(S *c, T a) {                                                      \
         T r = (T)(a - 1);                                                                          \
         c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r;                                \
-        c->of = a == (T)((T)1 << (BITS - 1));                                                      \
+        c->of = a == (T)((T)1 << (BITS - 1)); c->af = ((a ^ r) >> 4) & 1;                          \
         return r;                                                                                  \
     }                                                                                              \
     static inline T neg##BITS##X(S *c, T a) {                                                      \
         T r = (T)(0 - a);                                                                          \
         c->cf = a != 0; c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r;                \
-        c->of = a == (T)((T)1 << (BITS - 1));                                                      \
+        c->of = a == (T)((T)1 << (BITS - 1)); c->af = ((a ^ r) >> 4) & 1;                          \
         return r;                                                                                  \
     }                                                                                              \
     static inline T shl##BITS##X(S *c, T a, unsigned n) {                                          \
@@ -150,7 +159,7 @@ RC_INLINE int PFr(const Regs *c) { return !__builtin_parity(c->pf_byte); }
         T r = n >= BITS ? 0 : (T)(a << n);                                                         \
         c->cf = n <= BITS ? (a >> (BITS - n)) & 1 : 0;                                             \
         c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r;                                \
-        c->of = ((r >> (BITS - 1)) & 1) ^ c->cf;                                                   \
+        c->of = ((r >> (BITS - 1)) & 1) ^ c->cf; c->af = 0;                                        \
         return r;                                                                                  \
     }                                                                                              \
     static inline T shr##BITS##X(S *c, T a, unsigned n) {                                          \
@@ -158,7 +167,7 @@ RC_INLINE int PFr(const Regs *c) { return !__builtin_parity(c->pf_byte); }
         T r = n >= BITS ? 0 : (T)(a >> n);                                                         \
         c->cf = n <= BITS ? (a >> (n - 1)) & 1 : 0;                                                \
         c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r;                                \
-        c->of = (a >> (BITS - 1)) & 1;                                                             \
+        c->of = ((uint32_t)(((uint32_t)a >> (n - 1)) ^ r) >> (BITS - 1)) & 1; c->af = 0;           \
         return r;                                                                                  \
     }                                                                                              \
     static inline T sar##BITS##X(S *c, T a, unsigned n) {                                          \
@@ -166,7 +175,7 @@ RC_INLINE int PFr(const Regs *c) { return !__builtin_parity(c->pf_byte); }
         ST s = (ST)a;                                                                              \
         T r = (T)(n >= BITS ? (s < 0 ? -1 : 0) : (s >> n));                                        \
         c->cf = n >= BITS ? (s < 0) : (s >> (n - 1)) & 1;                                          \
-        c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r; c->of = 0;                     \
+        c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r; c->of = 0; c->af = 0;          \
         return r;                                                                                  \
     }                                                                                              \
     static inline T rol##BITS##X(S *c, T a, unsigned n) {                                          \
@@ -184,19 +193,23 @@ RC_INLINE int PFr(const Regs *c) { return !__builtin_parity(c->pf_byte); }
         return r;                                                                                  \
     }
 
+/* RCL/RCR: OF is defined for a count of 1 (the top bits of the result); for larger counts the SDM leaves it
+   undefined and QEMU gives the top bit of operand ^ result, which is the same thing at a count of 1 */
 #define DEF_RC(BITS, T, S, X)                                                                      \
     static inline T rcl##BITS##X(S *c, T a, unsigned n) {                                          \
         n = (n & 31) % (BITS + 1);                                                                 \
+        T src = a;                                                                                 \
         for (unsigned i = 0; i < n; i++) { unsigned out = (a >> (BITS - 1)) & 1;                   \
             a = (T)((a << 1) | c->cf); c->cf = out; }                                              \
-        if (n == 1) c->of = ((a >> (BITS - 1)) & 1) ^ c->cf;                                       \
+        if (n) c->of = ((src ^ a) >> (BITS - 1)) & 1;                                              \
         return a;                                                                                  \
     }                                                                                              \
     static inline T rcr##BITS##X(S *c, T a, unsigned n) {                                          \
         n = (n & 31) % (BITS + 1);                                                                 \
-        if (n == 1) c->of = ((a >> (BITS - 1)) & 1) ^ c->cf;                                       \
+        T src = a;                                                                                 \
         for (unsigned i = 0; i < n; i++) { unsigned out = a & 1;                                   \
             a = (T)((a >> 1) | ((T)c->cf << (BITS - 1))); c->cf = out; }                           \
+        if (n) c->of = ((src ^ a) >> (BITS - 1)) & 1;                                              \
         return a;                                                                                  \
     }
 
@@ -232,13 +245,14 @@ static inline void FCOM(CPU *c, double a, double b) {
     else if (a == b) sw |= 0x4000;
     c->fpu_sw = sw;
 }
+/* FCOMI/FUCOMI, COMISS/COMISD/UCOMISS/UCOMISD: ZF PF CF from the comparison; OF, SF and AF cleared */
 static inline void FCOMI(CPU *c, double a, double b) {
-    c->of = 0; c->sf = 0;
+    c->of = 0; c->sf = 0; c->af = 0;
     if (a != a || b != b) { c->zf = 1; c->pf_byte = 0; c->cf = 1; }
     else { c->zf = a == b; c->pf_byte = 1; c->cf = a < b; }
 }
 RC_INLINE void FCOMIr(Regs *c, double a, double b) {
-    c->of = 0; c->sf = 0;
+    c->of = 0; c->sf = 0; c->af = 0;
     if (a != a || b != b) { c->zf = 1; c->pf_byte = 0; c->cf = 1; }
     else { c->zf = a == b; c->pf_byte = 1; c->cf = a < b; }
 }
@@ -297,6 +311,25 @@ static inline double fld_f64(uint64_t u) {
     double d;
     memcpy(&d, &u, 8);
     return d;
+}
+/* x87 stores to single and double precision convert from the internal format, which also quiets a signalling
+   NaN (one loaded by FLD m80), keeping its sign and the payload bits the destination holds. Done on the bits:
+   the host's conversion of a NaN is not specified the same way everywhere (WebAssembly's f32.demote) */
+static inline uint32_t fst_f32(double v) {
+    uint64_t u;
+    memcpy(&u, &v, 8);
+    if ((u & 0x7ff0000000000000ull) == 0x7ff0000000000000ull && (u & 0x000fffffffffffffull))
+        return (uint32_t)(u >> 32 & 0x80000000u) | 0x7fc00000u | (uint32_t)(u >> 29 & 0x007fffffu);
+    float f = (float)v;
+    uint32_t r;
+    memcpy(&r, &f, 4);
+    return r;
+}
+static inline uint64_t fst_f64(double v) {
+    uint64_t u;
+    memcpy(&u, &v, 8);
+    if ((u & 0x7ff0000000000000ull) == 0x7ff0000000000000ull && (u & 0x000fffffffffffffull)) u |= 0x0008000000000000ull;
+    return u;
 }
 /* fsin/fcos: arguments with |x| >= 2^63 are left unchanged with C2 set, as on hardware; infinity is an invalid
    operand (real indefinite, C2 clear) */
